@@ -20,6 +20,8 @@ The client-facing web app lives in a separate repo —
 [**`guildworkman-web`**](https://github.com/workman-labs/guildworkman-web)
 (Next.js), live at **[guildworkman-web.vercel.app](https://guildworkman-web.vercel.app)**.
 
+Follow GuildWorkman on X: **[@guildworkman](https://x.com/guildworkman)**.
+
 ---
 
 ## Table of contents
