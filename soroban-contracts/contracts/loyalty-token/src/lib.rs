@@ -6,7 +6,16 @@
 //! and workers with points on completed appointments; holders can transfer
 //! or burn their own balance like any other token.
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, String};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, String, Vec,
+};
+
+use guildworkman_governance_guard as governance;
+pub use guildworkman_governance_guard::PendingUpgrade;
+
+/// Bump when this contract's storage layout actually changes shape and
+/// needs a real transformation in `migrate`. There's no such change yet.
+const CURRENT_STORAGE_VERSION: u32 = 1;
 
 #[contracttype]
 pub enum DataKey {
@@ -41,6 +50,35 @@ pub enum Error {
     InsufficientAllowance = 4,
     InvalidAmount = 5,
     NotAuthorized = 6,
+    // --- Upgrade governance (see guildworkman-governance-guard) ---
+    GovernanceAlreadyInitialized = 7,
+    GovernanceNotInitialized = 8,
+    InvalidThreshold = 9,
+    DuplicateSigner = 10,
+    NotASigner = 11,
+    NoPendingUpgrade = 12,
+    AlreadyApproved = 13,
+    ProposalExpired = 14,
+    HashMismatch = 15,
+    AlreadyMigrated = 16,
+    NothingToMigrate = 17,
+}
+
+impl From<governance::GovernanceError> for Error {
+    fn from(e: governance::GovernanceError) -> Self {
+        match e {
+            governance::GovernanceError::AlreadyInitialized => Error::GovernanceAlreadyInitialized,
+            governance::GovernanceError::NotInitialized => Error::GovernanceNotInitialized,
+            governance::GovernanceError::InvalidThreshold => Error::InvalidThreshold,
+            governance::GovernanceError::DuplicateSigner => Error::DuplicateSigner,
+            governance::GovernanceError::NotASigner => Error::NotASigner,
+            governance::GovernanceError::NoPendingUpgrade => Error::NoPendingUpgrade,
+            governance::GovernanceError::AlreadyApproved => Error::AlreadyApproved,
+            governance::GovernanceError::ProposalExpired => Error::ProposalExpired,
+            governance::GovernanceError::HashMismatch => Error::HashMismatch,
+            governance::GovernanceError::AlreadyMigrated => Error::AlreadyMigrated,
+        }
+    }
 }
 
 const DAY_IN_LEDGERS: u32 = 17_280;
@@ -64,11 +102,13 @@ impl LoyaltyToken {
         decimals: u32,
         name: String,
         symbol: String,
+        governance_init: governance::GovernanceInit,
     ) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::AlreadyInitialized);
         }
         admin.require_auth();
+        governance::init_governance(&env, governance_init)?;
 
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Minter, &minter);
@@ -84,6 +124,62 @@ impl LoyaltyToken {
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
         Ok(())
+    }
+
+    // ----- Upgrade governance -----
+
+    pub fn propose_upgrade(
+        env: Env,
+        proposer: Address,
+        wasm_hash: BytesN<32>,
+    ) -> Result<bool, Error> {
+        let ready = governance::propose_upgrade(&env, proposer, wasm_hash.clone())?;
+        if ready {
+            env.deployer().update_current_contract_wasm(wasm_hash);
+        }
+        Ok(ready)
+    }
+
+    pub fn approve_upgrade(
+        env: Env,
+        approver: Address,
+        wasm_hash: BytesN<32>,
+    ) -> Result<bool, Error> {
+        let ready = governance::approve_upgrade(&env, approver, wasm_hash.clone())?;
+        if ready {
+            env.deployer().update_current_contract_wasm(wasm_hash);
+        }
+        Ok(ready)
+    }
+
+    pub fn cancel_upgrade(env: Env, caller: Address) -> Result<(), Error> {
+        governance::cancel_upgrade(&env, caller).map_err(Into::into)
+    }
+
+    pub fn migrate(env: Env, signer: Address) -> Result<(), Error> {
+        governance::require_signer(&env, &signer)?;
+        if governance::current_storage_version(&env) >= CURRENT_STORAGE_VERSION {
+            return Err(Error::NothingToMigrate);
+        }
+        // No storage shape has changed since v1 — nothing to transform yet.
+        governance::mark_migrated(&env, CURRENT_STORAGE_VERSION)?;
+        Ok(())
+    }
+
+    pub fn get_signers(env: Env) -> Vec<Address> {
+        governance::get_signers(&env)
+    }
+
+    pub fn get_upgrade_threshold(env: Env) -> u32 {
+        governance::get_threshold(&env)
+    }
+
+    pub fn get_pending_upgrade(env: Env) -> Option<PendingUpgrade> {
+        governance::get_pending_upgrade(&env)
+    }
+
+    pub fn get_storage_version(env: Env) -> u32 {
+        governance::current_storage_version(&env)
     }
 
     /// Admin-only: rotate which address is allowed to mint reward points.
@@ -203,9 +299,11 @@ impl LoyaltyToken {
     fn read_balance(env: &Env, addr: Address) -> i128 {
         let key = DataKey::Balance(addr);
         if let Some(balance) = env.storage().persistent().get::<_, i128>(&key) {
-            env.storage()
-                .persistent()
-                .extend_ttl(&key, BALANCE_LIFETIME_THRESHOLD, BALANCE_BUMP_AMOUNT);
+            env.storage().persistent().extend_ttl(
+                &key,
+                BALANCE_LIFETIME_THRESHOLD,
+                BALANCE_BUMP_AMOUNT,
+            );
             balance
         } else {
             0
@@ -215,9 +313,11 @@ impl LoyaltyToken {
     fn write_balance(env: &Env, addr: Address, amount: i128) {
         let key = DataKey::Balance(addr);
         env.storage().persistent().set(&key, &amount);
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, BALANCE_LIFETIME_THRESHOLD, BALANCE_BUMP_AMOUNT);
+        env.storage().persistent().extend_ttl(
+            &key,
+            BALANCE_LIFETIME_THRESHOLD,
+            BALANCE_BUMP_AMOUNT,
+        );
     }
 
     fn receive_balance(env: &Env, addr: Address, amount: i128) {
@@ -268,7 +368,9 @@ impl LoyaltyToken {
         env.storage().temporary().set(&key, &allowance);
         if amount > 0 && expiration_ledger > env.ledger().sequence() {
             let live_for = expiration_ledger - env.ledger().sequence();
-            env.storage().temporary().extend_ttl(&key, live_for, live_for);
+            env.storage()
+                .temporary()
+                .extend_ttl(&key, live_for, live_for);
         }
     }
 
