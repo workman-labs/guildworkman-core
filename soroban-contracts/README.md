@@ -3,13 +3,14 @@
 ![CI](https://github.com/workman-labs/guildworkman-contracts/actions/workflows/ci.yml/badge.svg)
 
 Soroban (Stellar) smart contracts for GuildWorkman, the skilled-worker booking
-marketplace. This workspace has three independent contracts:
+marketplace. This workspace has four independent contracts:
 
 | Contract | Path | Purpose |
 |---|---|---|
 | `escrow` | `contracts/escrow` | Holds a client's payment for a booked appointment until the client confirms the job is done; releases funds to the skilled worker, refunds on cancellation, and supports admin-arbitrated disputes. |
 | `reputation` | `contracts/reputation` | Stores one immutable review per completed appointment and keeps a running rating aggregate per skilled worker. |
 | `loyalty-token` | `contracts/loyalty-token` | A SEP-41-style fungible token used to reward clients/workers with points on completed appointments. Only a designated `minter` (the backend's service account) can mint. |
+| `loyalty-emissions` | `contracts/loyalty-emissions` | An emission engine that owns the `loyalty-token`'s `minter` role. Instead of minting rewards in a lump sum, it streams them out of per-account linear vesting schedules, throttled by per-account and global rate limits, and lets the admin reclaim allocations left unclaimed past a deadline. |
 
 These mirror the domain already implemented server-side in the backend
 ([`../backend-api`](../backend-api): `AppointmentService`, `ReviewService`,
@@ -68,7 +69,10 @@ intended flow, if/when integrated, looks like:
    right after the client submits their in-app review, so on-chain reviews
    stay 1:1 with completed, paid appointments.
 4. Backend (as `minter`) calls `loyalty-token.mint` to reward the client
-   and/or worker some points for the completed appointment.
+   and/or worker some points for the completed appointment — or, for rewards
+   that should vest over time rather than land instantly, registers a
+   `loyalty-emissions.create_schedule` and lets the recipient `claim` the
+   stream as it vests (see [loyalty-emissions](#loyalty-emissions)).
 
 This requires the backend to hold a Stellar keypair per role (or per user, if
 going non-custodial) and a Soroban RPC client — none of that exists in
@@ -112,6 +116,17 @@ Each contract has unit tests under `contracts/<name>/src/test.rs` using
   between accounts; transferring more than the balance fails; approve +
   transfer_from spends down the allowance correctly; burn reduces balance;
   the admin can rotate the minter and the new minter can mint.
+- **loyalty-emissions** (24 tests): linear vesting reports the right amount at
+  the start, midpoint, and end of a stream and stays capped afterwards; a
+  cliff blocks vesting until it's reached; `claim` mints the vested delta and
+  incremental claims only mint what's newly vested; per-account and global
+  rate limits clamp a claim to the remaining window budget and open a fresh
+  budget the next window; the `claimable` view reflects both vesting and rate
+  limits; `reclaim` returns the unclaimed remainder only after the deadline and
+  blocks further claims; and adversarial paths — double-init, bad config, bad
+  schedule params, reclaim-before-vesting-end, double-claim, double-reclaim,
+  claiming a missing/reclaimed schedule, and looping claims across many windows
+  never mints more than a schedule's `total`.
 
 These are unit tests against the in-process Soroban test host
 (`Env::default()` + `mock_all_auths()`), not integration tests against a real
@@ -132,9 +147,21 @@ stellar contract invoke \
   -- initialize --admin <ADMIN_ADDRESS>
 ```
 
-Repeat `deploy` for `guildworkman_reputation.wasm` and
-`guildworkman_loyalty_token.wasm`, then call each contract's `initialize`
-once.
+Repeat `deploy` for `guildworkman_reputation.wasm`,
+`guildworkman_loyalty_token.wasm`, and `guildworkman_loyalty_emissions.wasm`,
+then call each contract's `initialize` once. For the emission engine to be
+able to mint, point it at the token in its `initialize` and then hand it the
+token's `minter` role:
+
+```sh
+stellar contract invoke --id $EMISSIONS --source admin --network testnet \
+  -- initialize --admin $ADMIN_ADDR --token $LOYALTY_CONTRACT_ID \
+     --config '{ "window": 17280, "account_cap": "1000", "global_cap": "100000" }'
+
+# Hand the token's minter role to the emissions contract.
+stellar contract invoke --id $LOYALTY --source admin --network testnet \
+  -- set_minter --new_minter $EMISSIONS
+```
 
 ## Contract interfaces
 
@@ -314,6 +341,111 @@ stellar contract invoke --id $LOYALTY --source admin --network testnet \
   -- symbol
 ```
 
+### loyalty-emissions
+
+An emission engine layered on top of `loyalty-token`. It holds the token's
+`minter` role and releases rewards as **linear vesting streams** rather than
+lump-sum mints, gated by anti-abuse rate limits, with an admin reclaim path for
+allocations left unclaimed past a deadline.
+
+- `initialize(admin: Address, token: Address, config: Config)` — `config` is
+  `{ window: u32, account_cap: i128, global_cap: i128 }`
+- `create_schedule(beneficiary: Address, total: i128, start: u32, cliff: u32, duration: u32, reclaimable_after: u32)` — admin-only; `start: 0` means "start now"
+- `claim(beneficiary: Address) -> i128` — beneficiary-authorized; mints the
+  vested-and-unclaimed amount clamped to the current rate-limit budget, returns
+  the amount minted
+- `reclaim(beneficiary: Address) -> i128` — admin-only; after `reclaimable_after`,
+  marks the schedule reclaimed and returns the never-minted remainder
+- `vested(beneficiary) -> i128`, `claimable(beneficiary) -> i128`,
+  `get_schedule(beneficiary) -> Schedule`, `get_config() -> Config`,
+  `get_admin() -> Address`, `get_token() -> Address` — read-only views
+
+#### Vesting & rate-limit model
+
+A schedule is `{ total, start, cliff, duration }`. At ledger `t`:
+
+- before `start + cliff` → nothing vested;
+- `start + cliff` .. `start + duration` → `vested = total * (t - start) / duration`;
+- at/after `start + duration` → fully vested (`total`).
+
+`claimable = vested - claimed`, then clamped to the smaller of the account's and
+the global remaining budget for the current window. Windows are fixed tumbling
+windows of `window` ledgers (`ledger / window`): each account may claim at most
+`account_cap` per window, and all accounts combined at most `global_cap` per
+window. `create_schedule` requires `reclaimable_after >= start + duration`, so
+the admin can never reclaim allocations that are still vesting.
+
+#### Storage layout
+
+| `DataKey` variant | Storage | Holds |
+|---|---|---|
+| `Admin` | instance | The admin `Address`; the only caller allowed to `create_schedule`/`reclaim`. |
+| `Token` | instance | The `loyalty-token` contract `Address` this engine mints through. |
+| `Config` | instance | `Config { window, account_cap, global_cap }`, fixed at `initialize`. |
+| `Schedule(Address)` | persistent | A `Schedule { total, claimed, start, cliff, duration, reclaimable_after, reclaimed }` per beneficiary. |
+| `AccountWindow(Address, u64)` | temporary | Units a given account has claimed in a given window index; enforces the per-account cap. Auto-expires ~2 windows after use. |
+| `GlobalWindow(u64)` | temporary | Units all accounts have claimed in a given window index; enforces the global cap. |
+
+#### Errors
+
+| Variant | Code | Meaning |
+|---|---|---|
+| `AlreadyInitialized` | 1 | `initialize` called more than once. |
+| `NotInitialized` | 2 | A method needing state was called before `initialize`. |
+| `InvalidConfig` | 3 | `window == 0` or a non-positive cap passed to `initialize`. |
+| `InvalidSchedule` | 4 | `total <= 0`, `duration == 0`, `cliff > duration`, or `reclaimable_after < start + duration`. |
+| `ScheduleExists` | 5 | `create_schedule` for a beneficiary that already has one. |
+| `ScheduleNotFound` | 6 | No schedule stored for that beneficiary. |
+| `NothingToClaim` | 7 | Nothing has vested beyond what's already claimed. |
+| `AccountRateLimited` | 8 | The account's per-window budget is already exhausted. |
+| `GlobalRateLimited` | 9 | The global per-window budget is already exhausted. |
+| `NotYetReclaimable` | 10 | `reclaim` called before `reclaimable_after`. |
+| `AlreadyReclaimed` | 11 | `claim`/`reclaim` on an already-reclaimed schedule. |
+| `NothingToReclaim` | 12 | `reclaim` when the schedule was already fully claimed. |
+
+#### Authorization & safety notes
+
+- **Trust root is the admin.** Only the admin can register or reclaim
+  schedules. `claim` is authorized by the beneficiary themselves.
+- **The engine, not the backend, is the token's `minter`.** After deployment
+  the admin must call `loyalty-token.set_minter` with the emission contract's
+  address; the token then only mints through vesting + rate-limit checks.
+- **Reclaim cannot rug a vesting stream.** Because `reclaimable_after` is forced
+  to be at or after the vesting end, the admin can only reclaim what a
+  beneficiary chose not to claim after the stream fully vested — never
+  still-vesting funds.
+- **Reclaim is un-mint, not burn.** Reclaimed units were never minted, so no
+  balance is touched; the schedule is simply closed.
+
+#### CLI usage
+
+```sh
+# One-time setup (see the Deploy section for wiring the minter role).
+stellar contract invoke --id $EMISSIONS --source admin --network testnet \
+  -- initialize --admin $ADMIN_ADDR --token $LOYALTY_CONTRACT_ID \
+     --config '{ "window": 17280, "account_cap": "1000", "global_cap": "100000" }'
+
+# Admin registers a stream: 5000 points vesting over 30 days (starting now),
+# reclaimable after ~31 days if left unclaimed.
+stellar contract invoke --id $EMISSIONS --source admin --network testnet \
+  -- create_schedule --beneficiary $WORKER_ADDR --total 5000 \
+     --start 0 --cliff 0 --duration 518400 --reclaimable_after 535680
+
+# Worker claims whatever has vested and fits the rate limit.
+stellar contract invoke --id $EMISSIONS --source worker --network testnet \
+  -- claim --beneficiary $WORKER_ADDR
+
+# Read-only views.
+stellar contract invoke --id $EMISSIONS --source admin --network testnet \
+  -- vested --beneficiary $WORKER_ADDR
+stellar contract invoke --id $EMISSIONS --source admin --network testnet \
+  -- claimable --beneficiary $WORKER_ADDR
+
+# Admin reclaims the unclaimed remainder after the deadline.
+stellar contract invoke --id $EMISSIONS --source admin --network testnet \
+  -- reclaim --beneficiary $WORKER_ADDR
+```
+
 ## Security considerations / known limitations
 
 - **Unaudited.** None of these contracts have had an independent security
@@ -327,9 +459,13 @@ stellar contract invoke --id $LOYALTY --source admin --network testnet \
   the full amount goes to either the client or the worker. There's no
   mechanism for a partially-completed job.
 - **Single point of trust for admin.** The `escrow` admin unilaterally
-  decides disputes, and the `loyalty-token` admin unilaterally controls who
-  can mint. Both are single-key roles with no timelock, multisig, or on-chain
-  governance — compromising that key compromises the contract.
+  decides disputes, the `loyalty-token` admin unilaterally controls who can
+  mint, and the `loyalty-emissions` admin unilaterally registers and reclaims
+  vesting schedules. All are single-key roles with no timelock, multisig, or
+  on-chain governance — compromising that key compromises the contract. Note
+  `loyalty-emissions` deliberately blocks reclaiming still-vesting funds
+  (`reclaimable_after >= start + duration`), so even a compromised admin cannot
+  claw back what has already vested to a beneficiary before they claim it.
 - **No spam/rate limiting beyond one-review-per-appointment.** `reputation`
   only prevents double-reviewing the same `appointment_id`; it does not
   prevent a client and worker from colluding to create fake appointments

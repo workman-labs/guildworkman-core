@@ -733,6 +733,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "guildworkman-loyalty-emissions"
+version = "0.1.0"
+dependencies = [
+ "guildworkman-loyalty-token",
+ "soroban-sdk",
+]
+
+[[package]]
 name = "guildworkman-loyalty-token"
 version = "0.1.0"
 dependencies = [

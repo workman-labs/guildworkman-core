@@ -23,8 +23,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32v1-none
+          components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: soroban-contracts
-      - run: cargo test --workspace
-      - run: cargo build --workspace --release --target wasm32v1-none
+      - name: Clippy (warnings are errors)
+        run: cargo clippy --workspace -- -D warnings
+      - name: Tests
+        run: cargo test --workspace
+      - name: Optimized WASM build
+        run: cargo build --workspace --release --target wasm32v1-none
