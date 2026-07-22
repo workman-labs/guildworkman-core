@@ -151,9 +151,16 @@ pub fn require_signer(env: &Env, caller: &Address) -> Result<(), GovernanceError
     Ok(())
 }
 
-/// Opens a new upgrade proposal for `wasm_hash`, replacing any existing
-/// pending proposal (for a different hash or one that expired). The
-/// proposer's approval counts immediately, so with a 1-of-N governance
+/// Opens a new upgrade proposal for `wasm_hash`, unconditionally discarding
+/// whatever proposal was previously pending, if any — including its
+/// approvals. This is not limited to a *different* hash or an *expired*
+/// proposal: calling this twice in a row for the identical hash still
+/// resets the approval count back to one (just the new call's proposer).
+/// Every signer who wants the new proposal to succeed has to call
+/// `approve_upgrade` again, even ones who already approved the exact same
+/// hash under the proposal this replaced.
+///
+/// The proposer's approval counts immediately, so with a 1-of-N governance
 /// setup this call alone reaches threshold — returns `Ok(true)` in that
 /// case, exactly like [`approve_upgrade`] does when its approval is the
 /// one that crosses the line. A 1-signer governance can't reach threshold
