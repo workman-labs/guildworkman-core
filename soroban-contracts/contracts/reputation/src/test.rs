@@ -16,6 +16,13 @@ fn default_config() -> Config {
     }
 }
 
+fn single_signer(env: &Env) -> (soroban_sdk::Vec<Address>, Address) {
+    let signer = Address::generate(env);
+    let mut signers = soroban_sdk::Vec::new(env);
+    signers.push_back(signer.clone());
+    (signers, signer)
+}
+
 fn setup() -> (Env, ReputationContractClient<'static>, Address, Address) {
     let env = Env::default();
     env.mock_all_auths();
@@ -26,7 +33,8 @@ fn setup() -> (Env, ReputationContractClient<'static>, Address, Address) {
     let contract_id = env.register(ReputationContract, ());
     let contract = ReputationContractClient::new(&env, &contract_id);
 
-    contract.initialize(&Address::generate(&env), &default_config());
+    let (signers, _signer) = single_signer(&env);
+    contract.initialize(&Address::generate(&env), &default_config(), &signers, &1);
 
     (env, contract, client, worker)
 }
@@ -42,13 +50,43 @@ fn setup_with_admin() -> (Env, ReputationContractClient<'static>, Address, Addre
     let contract_id = env.register(ReputationContract, ());
     let contract = ReputationContractClient::new(&env, &contract_id);
 
-    contract.initialize(&admin, &default_config());
+    let (signers, _signer) = single_signer(&env);
+    contract.initialize(&admin, &default_config(), &signers, &1);
 
     (env, contract, admin, client, worker)
 }
 
+/// Same as `setup_with_admin`, but also hands back the governance signer
+/// and the raw wasm hash used across the upgrade-governance tests.
+fn setup_with_governance() -> (
+    Env,
+    ReputationContractClient<'static>,
+    Address,
+    soroban_sdk::Vec<Address>,
+) {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let contract_id = env.register(ReputationContract, ());
+    let contract = ReputationContractClient::new(&env, &contract_id);
+
+    let mut signers = soroban_sdk::Vec::new(&env);
+    signers.push_back(Address::generate(&env));
+    signers.push_back(Address::generate(&env));
+    signers.push_back(Address::generate(&env));
+
+    contract.initialize(&admin, &default_config(), &signers, &2);
+
+    (env, contract, admin, signers)
+}
+
 fn dummy_hash(env: &Env) -> BytesN<32> {
     BytesN::from_array(env, &[0u8; 32])
+}
+
+fn other_hash(env: &Env) -> BytesN<32> {
+    BytesN::from_array(env, &[7u8; 32])
 }
 
 fn set_ledger(env: &Env, seq: u32) {
@@ -236,8 +274,9 @@ fn double_initialize_fails() {
     let contract_id = env.register(ReputationContract, ());
     let contract = ReputationContractClient::new(&env, &contract_id);
 
-    contract.initialize(&admin, &default_config());
-    let result = contract.try_initialize(&admin, &default_config());
+    let (signers, _signer) = single_signer(&env);
+    contract.initialize(&admin, &default_config(), &signers, &1);
+    let result = contract.try_initialize(&admin, &default_config(), &signers, &1);
     assert_eq!(result, Err(Ok(Error::AlreadyInitialized)));
 }
 
@@ -257,20 +296,21 @@ fn invalid_config_rejected() {
     let admin = Address::generate(&env);
     let contract_id = env.register(ReputationContract, ());
     let contract = ReputationContractClient::new(&env, &contract_id);
+    let (signers, _signer) = single_signer(&env);
 
     let mut config = default_config();
     config.window = 0;
-    let result = contract.try_initialize(&admin, &config);
+    let result = contract.try_initialize(&admin, &config, &signers, &1);
     assert_eq!(result, Err(Ok(Error::InvalidConfig)));
 
     config = default_config();
     config.reviewer_cap = 0;
-    let result = contract.try_initialize(&admin, &config);
+    let result = contract.try_initialize(&admin, &config, &signers, &1);
     assert_eq!(result, Err(Ok(Error::InvalidConfig)));
 
     config = default_config();
     config.decay_rate_bps = 0;
-    let result = contract.try_initialize(&admin, &config);
+    let result = contract.try_initialize(&admin, &config, &signers, &1);
     assert_eq!(result, Err(Ok(Error::InvalidConfig)));
 }
 
@@ -505,4 +545,116 @@ fn get_config_returns_config() {
     assert_eq!(config.window, 100);
     assert_eq!(config.reviewer_cap, 5);
     assert_eq!(config.global_cap, 20);
+}
+
+// ===========================================================================
+// Upgrade governance
+//
+// These stop one approval short of the configured threshold everywhere,
+// deliberately. Crossing it calls env.deployer().update_current_contract_wasm,
+// which requires the hash to correspond to Wasm actually uploaded on the
+// ledger — there's no such artifact available inside a plain `cargo test`
+// run. What's tested here is everything up to that point: signer checks,
+// threshold math, replay/expiry protection, and the migration version gate,
+// all exercised through the real contract entrypoints rather than by calling
+// guildworkman-governance-guard directly (that crate's own 20 tests already
+// cover the underlying logic in isolation).
+// ===========================================================================
+
+#[test]
+fn initialize_stores_governance_config() {
+    let (_env, contract, _admin, signers) = setup_with_governance();
+
+    assert_eq!(contract.get_signers(), signers);
+    assert_eq!(contract.get_upgrade_threshold(), 2);
+    assert_eq!(contract.get_storage_version(), 1);
+}
+
+#[test]
+fn propose_upgrade_by_non_signer_fails() {
+    let (env, contract, _admin, _signers) = setup_with_governance();
+    let outsider = Address::generate(&env);
+
+    let result = contract.try_propose_upgrade(&outsider, &dummy_hash(&env));
+    assert_eq!(result, Err(Ok(Error::NotASigner)));
+}
+
+#[test]
+fn propose_upgrade_below_threshold_is_not_ready() {
+    let (env, contract, _admin, signers) = setup_with_governance();
+
+    let ready = contract.propose_upgrade(&signers.get_unchecked(0), &dummy_hash(&env));
+    assert!(!ready);
+
+    let pending = contract.get_pending_upgrade().unwrap();
+    assert_eq!(pending.wasm_hash, dummy_hash(&env));
+    assert_eq!(pending.approvals.len(), 1);
+}
+
+#[test]
+fn approve_upgrade_by_non_signer_fails() {
+    let (env, contract, _admin, signers) = setup_with_governance();
+    contract.propose_upgrade(&signers.get_unchecked(0), &dummy_hash(&env));
+
+    let outsider = Address::generate(&env);
+    let result = contract.try_approve_upgrade(&outsider, &dummy_hash(&env));
+    assert_eq!(result, Err(Ok(Error::NotASigner)));
+}
+
+#[test]
+fn approve_upgrade_with_wrong_hash_fails() {
+    let (env, contract, _admin, signers) = setup_with_governance();
+    contract.propose_upgrade(&signers.get_unchecked(0), &dummy_hash(&env));
+
+    let result = contract.try_approve_upgrade(&signers.get_unchecked(1), &other_hash(&env));
+    assert_eq!(result, Err(Ok(Error::HashMismatch)));
+}
+
+#[test]
+fn same_signer_approving_twice_fails() {
+    let (env, contract, _admin, signers) = setup_with_governance();
+    contract.propose_upgrade(&signers.get_unchecked(0), &dummy_hash(&env));
+
+    let result = contract.try_approve_upgrade(&signers.get_unchecked(0), &dummy_hash(&env));
+    assert_eq!(result, Err(Ok(Error::AlreadyApproved)));
+}
+
+#[test]
+fn cancel_upgrade_clears_the_pending_proposal() {
+    let (env, contract, _admin, signers) = setup_with_governance();
+    contract.propose_upgrade(&signers.get_unchecked(0), &dummy_hash(&env));
+    assert!(contract.get_pending_upgrade().is_some());
+
+    // The third signer, who never approved, can still cancel.
+    contract.cancel_upgrade(&signers.get_unchecked(2));
+    assert!(contract.get_pending_upgrade().is_none());
+}
+
+#[test]
+fn cancel_upgrade_by_non_signer_fails() {
+    let (env, contract, _admin, signers) = setup_with_governance();
+    contract.propose_upgrade(&signers.get_unchecked(0), &dummy_hash(&env));
+
+    let outsider = Address::generate(&env);
+    let result = contract.try_cancel_upgrade(&outsider);
+    assert_eq!(result, Err(Ok(Error::NotASigner)));
+}
+
+#[test]
+fn migrate_by_non_signer_fails() {
+    let (env, contract, _admin, _signers) = setup_with_governance();
+    let outsider = Address::generate(&env);
+
+    let result = contract.try_migrate(&outsider);
+    assert_eq!(result, Err(Ok(Error::NotASigner)));
+}
+
+#[test]
+fn migrate_with_nothing_to_migrate_fails() {
+    let (_env, contract, _admin, signers) = setup_with_governance();
+
+    // Fresh init already sits at CURRENT_STORAGE_VERSION — there's no v2
+    // shipped yet, so there's nothing for a signer to migrate.
+    let result = contract.try_migrate(&signers.get_unchecked(0));
+    assert_eq!(result, Err(Ok(Error::NothingToMigrate)));
 }
