@@ -49,7 +49,13 @@ fn setup() -> TestCtx<'static> {
     signers.push_back(Address::generate(&env));
     signers.push_back(Address::generate(&env));
     signers.push_back(Address::generate(&env));
-    contract.initialize(&admin, &signers, &2);
+    contract.initialize(
+        &admin,
+        &governance::GovernanceInit {
+            signers: signers.clone(),
+            threshold: 2,
+        },
+    );
 
     TestCtx {
         env,
@@ -71,10 +77,7 @@ fn happy_path_completion_pays_worker() {
     ctx.contract
         .create_appointment(&1, &ctx.client, &ctx.worker, &ctx.token, &10_000);
     assert_eq!(ctx.token_client.balance(&ctx.client), 990_000);
-    assert_eq!(
-        ctx.token_client.balance(&ctx.contract.address),
-        10_000
-    );
+    assert_eq!(ctx.token_client.balance(&ctx.contract.address), 10_000);
 
     ctx.contract.confirm_completion(&1);
     assert_eq!(ctx.token_client.balance(&ctx.worker), 10_000);
@@ -94,10 +97,7 @@ fn cancel_refunds_client() {
 
     assert_eq!(ctx.token_client.balance(&ctx.client), 1_000_000);
     assert_eq!(ctx.token_client.balance(&ctx.contract.address), 0);
-    assert_eq!(
-        ctx.contract.get_appointment(&2).status,
-        Status::Cancelled
-    );
+    assert_eq!(ctx.contract.get_appointment(&2).status, Status::Cancelled);
 }
 
 #[test]
@@ -111,10 +111,7 @@ fn dispute_resolved_in_favor_of_worker() {
 
     ctx.contract.resolve_dispute(&3, &false);
     assert_eq!(ctx.token_client.balance(&ctx.worker), 7_000);
-    assert_eq!(
-        ctx.contract.get_appointment(&3).status,
-        Status::Resolved
-    );
+    assert_eq!(ctx.contract.get_appointment(&3).status, Status::Resolved);
 }
 
 #[test]
@@ -123,13 +120,9 @@ fn duplicate_appointment_id_rejected() {
     ctx.contract
         .create_appointment(&4, &ctx.client, &ctx.worker, &ctx.token, &1_000);
 
-    let result = ctx.contract.try_create_appointment(
-        &4,
-        &ctx.client,
-        &ctx.worker,
-        &ctx.token,
-        &1_000,
-    );
+    let result =
+        ctx.contract
+            .try_create_appointment(&4, &ctx.client, &ctx.worker, &ctx.token, &1_000);
     assert_eq!(result, Err(Ok(Error::AppointmentExists)));
 }
 
@@ -165,7 +158,9 @@ fn initialize_stores_governance_config() {
 fn propose_upgrade_by_non_signer_fails() {
     let ctx = setup();
     let outsider = Address::generate(&ctx.env);
-    let result = ctx.contract.try_propose_upgrade(&outsider, &dummy_hash(&ctx.env));
+    let result = ctx
+        .contract
+        .try_propose_upgrade(&outsider, &dummy_hash(&ctx.env));
     assert_eq!(result, Err(Ok(Error::NotASigner)));
 }
 
@@ -174,7 +169,9 @@ fn approve_upgrade_reaches_threshold_after_a_second_distinct_signer() {
     let ctx = setup();
     let target = dummy_hash(&ctx.env);
 
-    let ready = ctx.contract.propose_upgrade(&ctx.signers.get_unchecked(0), &target);
+    let ready = ctx
+        .contract
+        .propose_upgrade(&ctx.signers.get_unchecked(0), &target);
     assert!(!ready);
 
     // Stop here rather than approving with the second signer — that call

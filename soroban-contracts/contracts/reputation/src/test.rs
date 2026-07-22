@@ -23,6 +23,10 @@ fn single_signer(env: &Env) -> (soroban_sdk::Vec<Address>, Address) {
     (signers, signer)
 }
 
+fn gov_init(signers: soroban_sdk::Vec<Address>, threshold: u32) -> governance::GovernanceInit {
+    governance::GovernanceInit { signers, threshold }
+}
+
 fn setup() -> (Env, ReputationContractClient<'static>, Address, Address) {
     let env = Env::default();
     env.mock_all_auths();
@@ -34,12 +38,22 @@ fn setup() -> (Env, ReputationContractClient<'static>, Address, Address) {
     let contract = ReputationContractClient::new(&env, &contract_id);
 
     let (signers, _signer) = single_signer(&env);
-    contract.initialize(&Address::generate(&env), &default_config(), &signers, &1);
+    contract.initialize(
+        &Address::generate(&env),
+        &default_config(),
+        &gov_init(signers, 1),
+    );
 
     (env, contract, client, worker)
 }
 
-fn setup_with_admin() -> (Env, ReputationContractClient<'static>, Address, Address, Address) {
+fn setup_with_admin() -> (
+    Env,
+    ReputationContractClient<'static>,
+    Address,
+    Address,
+    Address,
+) {
     let env = Env::default();
     env.mock_all_auths();
 
@@ -51,7 +65,7 @@ fn setup_with_admin() -> (Env, ReputationContractClient<'static>, Address, Addre
     let contract = ReputationContractClient::new(&env, &contract_id);
 
     let (signers, _signer) = single_signer(&env);
-    contract.initialize(&admin, &default_config(), &signers, &1);
+    contract.initialize(&admin, &default_config(), &gov_init(signers, 1));
 
     (env, contract, admin, client, worker)
 }
@@ -76,7 +90,7 @@ fn setup_with_governance() -> (
     signers.push_back(Address::generate(&env));
     signers.push_back(Address::generate(&env));
 
-    contract.initialize(&admin, &default_config(), &signers, &2);
+    contract.initialize(&admin, &default_config(), &gov_init(signers.clone(), 2));
 
     (env, contract, admin, signers)
 }
@@ -147,7 +161,10 @@ fn stake_weighting_favors_higher_stake() {
     // weight_sum = 1000*10000 + 100*10000 = 10000000 + 1000000 = 11000000
     // score = (54000000 * 10000) / 11000000 = 49090 (approx 4.9090)
     let score = contract.get_reputation_score_x10000(&worker);
-    assert!(score > 45000, "score should be closer to 5 than 4, got {score}");
+    assert!(
+        score > 45000,
+        "score should be closer to 5 than 4, got {score}"
+    );
     assert!(score < 50000, "score should be less than 5, got {score}");
 }
 
@@ -172,13 +189,7 @@ fn cannot_review_same_appointment_twice() {
     let (env, contract, client, worker) = setup();
 
     contract.submit_attestation(&1, &client, &worker, &5, &dummy_hash(&env));
-    let result = contract.try_submit_attestation(
-        &1,
-        &client,
-        &worker,
-        &4,
-        &dummy_hash(&env),
-    );
+    let result = contract.try_submit_attestation(&1, &client, &worker, &4, &dummy_hash(&env));
     assert_eq!(result, Err(Ok(Error::AlreadyReviewed)));
 }
 
@@ -275,8 +286,8 @@ fn double_initialize_fails() {
     let contract = ReputationContractClient::new(&env, &contract_id);
 
     let (signers, _signer) = single_signer(&env);
-    contract.initialize(&admin, &default_config(), &signers, &1);
-    let result = contract.try_initialize(&admin, &default_config(), &signers, &1);
+    contract.initialize(&admin, &default_config(), &gov_init(signers.clone(), 1));
+    let result = contract.try_initialize(&admin, &default_config(), &gov_init(signers, 1));
     assert_eq!(result, Err(Ok(Error::AlreadyInitialized)));
 }
 
@@ -300,17 +311,17 @@ fn invalid_config_rejected() {
 
     let mut config = default_config();
     config.window = 0;
-    let result = contract.try_initialize(&admin, &config, &signers, &1);
+    let result = contract.try_initialize(&admin, &config, &gov_init(signers.clone(), 1));
     assert_eq!(result, Err(Ok(Error::InvalidConfig)));
 
     config = default_config();
     config.reviewer_cap = 0;
-    let result = contract.try_initialize(&admin, &config, &signers, &1);
+    let result = contract.try_initialize(&admin, &config, &gov_init(signers.clone(), 1));
     assert_eq!(result, Err(Ok(Error::InvalidConfig)));
 
     config = default_config();
     config.decay_rate_bps = 0;
-    let result = contract.try_initialize(&admin, &config, &signers, &1);
+    let result = contract.try_initialize(&admin, &config, &gov_init(signers, 1));
     assert_eq!(result, Err(Ok(Error::InvalidConfig)));
 }
 

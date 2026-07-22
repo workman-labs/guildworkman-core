@@ -1,9 +1,11 @@
-use soroban_sdk::{contract, testutils::Address as _, testutils::Ledger, Address, BytesN, Env, Vec};
+use soroban_sdk::{
+    contract, testutils::Address as _, testutils::Ledger, Address, BytesN, Env, Vec,
+};
 
 use crate::{
     approve_upgrade, cancel_upgrade, current_storage_version, get_pending_upgrade, get_signers,
     get_threshold, init_governance, mark_migrated, propose_upgrade, require_signer,
-    GovernanceError, PendingUpgrade, PROPOSAL_TTL_LEDGERS,
+    GovernanceError, GovernanceInit, PendingUpgrade, PROPOSAL_TTL_LEDGERS,
 };
 
 // This crate has no #[contract] of its own — it's a library other contracts
@@ -19,15 +21,32 @@ fn new_host(env: &Env) -> Address {
     env.register(TestHost, ())
 }
 
-fn init(env: &Env, id: &Address, signers: Vec<Address>, threshold: u32) -> Result<(), GovernanceError> {
-    env.as_contract(id, || init_governance(env, signers, threshold))
+fn init(
+    env: &Env,
+    id: &Address,
+    signers: Vec<Address>,
+    threshold: u32,
+) -> Result<(), GovernanceError> {
+    env.as_contract(id, || {
+        init_governance(env, GovernanceInit { signers, threshold })
+    })
 }
 
-fn propose(env: &Env, id: &Address, proposer: Address, wasm_hash: BytesN<32>) -> Result<bool, GovernanceError> {
+fn propose(
+    env: &Env,
+    id: &Address,
+    proposer: Address,
+    wasm_hash: BytesN<32>,
+) -> Result<bool, GovernanceError> {
     env.as_contract(id, || propose_upgrade(env, proposer, wasm_hash))
 }
 
-fn approve(env: &Env, id: &Address, approver: Address, wasm_hash: BytesN<32>) -> Result<bool, GovernanceError> {
+fn approve(
+    env: &Env,
+    id: &Address,
+    approver: Address,
+    wasm_hash: BytesN<32>,
+) -> Result<bool, GovernanceError> {
     env.as_contract(id, || approve_upgrade(env, approver, wasm_hash))
 }
 
@@ -337,7 +356,10 @@ fn require_signer_accepts_a_configured_signer_and_rejects_an_outsider() {
     assert!(check_signer(&env, &id, signers.get_unchecked(0)).is_ok());
 
     let outsider = Address::generate(&env);
-    assert_eq!(check_signer(&env, &id, outsider), Err(GovernanceError::NotASigner));
+    assert_eq!(
+        check_signer(&env, &id, outsider),
+        Err(GovernanceError::NotASigner)
+    );
 }
 
 #[test]

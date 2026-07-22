@@ -67,6 +67,17 @@ pub struct PendingUpgrade {
     pub proposed_at_ledger: u32,
 }
 
+/// Bundles the two `init_governance` arguments into one so host contracts'
+/// own `initialize` — already taking an admin and whatever else it needs —
+/// doesn't creep past clippy's argument-count lint by bolting on two more
+/// loose parameters.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GovernanceInit {
+    pub signers: Vec<Address>,
+    pub threshold: u32,
+}
+
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 pub enum GovernanceError {
@@ -95,7 +106,9 @@ pub const PROPOSAL_TTL_LEDGERS: u32 = 120_960;
 /// own governance problem; shipping it here would roughly double this
 /// crate's attack surface for a capability this issue didn't ask for.
 /// Left as a deliberate follow-up.
-pub fn init_governance(env: &Env, signers: Vec<Address>, threshold: u32) -> Result<(), GovernanceError> {
+pub fn init_governance(env: &Env, init: GovernanceInit) -> Result<(), GovernanceError> {
+    let GovernanceInit { signers, threshold } = init;
+
     if env.storage().instance().has(&GovernanceDataKey::Signers) {
         return Err(GovernanceError::AlreadyInitialized);
     }
@@ -110,9 +123,15 @@ pub fn init_governance(env: &Env, signers: Vec<Address>, threshold: u32) -> Resu
         }
     }
 
-    env.storage().instance().set(&GovernanceDataKey::Signers, &signers);
-    env.storage().instance().set(&GovernanceDataKey::Threshold, &threshold);
-    env.storage().instance().set(&GovernanceDataKey::StorageVersion, &1u32);
+    env.storage()
+        .instance()
+        .set(&GovernanceDataKey::Signers, &signers);
+    env.storage()
+        .instance()
+        .set(&GovernanceDataKey::Threshold, &threshold);
+    env.storage()
+        .instance()
+        .set(&GovernanceDataKey::StorageVersion, &1u32);
     Ok(())
 }
 
@@ -140,7 +159,11 @@ pub fn require_signer(env: &Env, caller: &Address) -> Result<(), GovernanceError
 /// one that crosses the line. A 1-signer governance can't reach threshold
 /// through a later distinct `approve_upgrade` call, since there's no
 /// second signer left to place it, so this has to be checked here too.
-pub fn propose_upgrade(env: &Env, proposer: Address, wasm_hash: BytesN<32>) -> Result<bool, GovernanceError> {
+pub fn propose_upgrade(
+    env: &Env,
+    proposer: Address,
+    wasm_hash: BytesN<32>,
+) -> Result<bool, GovernanceError> {
     require_signer(env, &proposer)?;
 
     let mut approvals = Vec::new(env);
@@ -150,14 +173,18 @@ pub fn propose_upgrade(env: &Env, proposer: Address, wasm_hash: BytesN<32>) -> R
     let ready = approvals.len() >= threshold;
 
     if ready {
-        env.storage().instance().remove(&GovernanceDataKey::PendingUpgrade);
+        env.storage()
+            .instance()
+            .remove(&GovernanceDataKey::PendingUpgrade);
     } else {
         let pending = PendingUpgrade {
             wasm_hash,
             approvals,
             proposed_at_ledger: env.ledger().sequence(),
         };
-        env.storage().instance().set(&GovernanceDataKey::PendingUpgrade, &pending);
+        env.storage()
+            .instance()
+            .set(&GovernanceDataKey::PendingUpgrade, &pending);
     }
     Ok(ready)
 }
@@ -173,7 +200,11 @@ pub fn propose_upgrade(env: &Env, proposer: Address, wasm_hash: BytesN<32>) -> R
 /// approval on a *different*, never-proposed hash being replayed against
 /// a stale approvals list — there's nothing to replay against once it's
 /// gone.
-pub fn approve_upgrade(env: &Env, approver: Address, wasm_hash: BytesN<32>) -> Result<bool, GovernanceError> {
+pub fn approve_upgrade(
+    env: &Env,
+    approver: Address,
+    wasm_hash: BytesN<32>,
+) -> Result<bool, GovernanceError> {
     require_signer(env, &approver)?;
 
     let mut pending: PendingUpgrade = env
@@ -183,7 +214,9 @@ pub fn approve_upgrade(env: &Env, approver: Address, wasm_hash: BytesN<32>) -> R
         .ok_or(GovernanceError::NoPendingUpgrade)?;
 
     if env.ledger().sequence() > pending.proposed_at_ledger + PROPOSAL_TTL_LEDGERS {
-        env.storage().instance().remove(&GovernanceDataKey::PendingUpgrade);
+        env.storage()
+            .instance()
+            .remove(&GovernanceDataKey::PendingUpgrade);
         return Err(GovernanceError::ProposalExpired);
     }
     if pending.wasm_hash != wasm_hash {
@@ -199,9 +232,13 @@ pub fn approve_upgrade(env: &Env, approver: Address, wasm_hash: BytesN<32>) -> R
     let ready = pending.approvals.len() >= threshold;
 
     if ready {
-        env.storage().instance().remove(&GovernanceDataKey::PendingUpgrade);
+        env.storage()
+            .instance()
+            .remove(&GovernanceDataKey::PendingUpgrade);
     } else {
-        env.storage().instance().set(&GovernanceDataKey::PendingUpgrade, &pending);
+        env.storage()
+            .instance()
+            .set(&GovernanceDataKey::PendingUpgrade, &pending);
     }
     Ok(ready)
 }
@@ -213,10 +250,16 @@ pub fn approve_upgrade(env: &Env, approver: Address, wasm_hash: BytesN<32>) -> R
 /// on from lingering, even if they can't force one through.
 pub fn cancel_upgrade(env: &Env, caller: Address) -> Result<(), GovernanceError> {
     require_signer(env, &caller)?;
-    if !env.storage().instance().has(&GovernanceDataKey::PendingUpgrade) {
+    if !env
+        .storage()
+        .instance()
+        .has(&GovernanceDataKey::PendingUpgrade)
+    {
         return Err(GovernanceError::NoPendingUpgrade);
     }
-    env.storage().instance().remove(&GovernanceDataKey::PendingUpgrade);
+    env.storage()
+        .instance()
+        .remove(&GovernanceDataKey::PendingUpgrade);
     Ok(())
 }
 
@@ -228,15 +271,23 @@ pub fn get_signers(env: &Env) -> Vec<Address> {
 }
 
 pub fn get_threshold(env: &Env) -> u32 {
-    env.storage().instance().get(&GovernanceDataKey::Threshold).unwrap_or(0)
+    env.storage()
+        .instance()
+        .get(&GovernanceDataKey::Threshold)
+        .unwrap_or(0)
 }
 
 pub fn get_pending_upgrade(env: &Env) -> Option<PendingUpgrade> {
-    env.storage().instance().get(&GovernanceDataKey::PendingUpgrade)
+    env.storage()
+        .instance()
+        .get(&GovernanceDataKey::PendingUpgrade)
 }
 
 pub fn current_storage_version(env: &Env) -> u32 {
-    env.storage().instance().get(&GovernanceDataKey::StorageVersion).unwrap_or(1)
+    env.storage()
+        .instance()
+        .get(&GovernanceDataKey::StorageVersion)
+        .unwrap_or(1)
 }
 
 /// Records that migration to `to_version` has been applied. The host
@@ -248,7 +299,9 @@ pub fn mark_migrated(env: &Env, to_version: u32) -> Result<(), GovernanceError> 
     if to_version <= current_storage_version(env) {
         return Err(GovernanceError::AlreadyMigrated);
     }
-    env.storage().instance().set(&GovernanceDataKey::StorageVersion, &to_version);
+    env.storage()
+        .instance()
+        .set(&GovernanceDataKey::StorageVersion, &to_version);
     Ok(())
 }
 

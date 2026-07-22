@@ -5,9 +5,7 @@
 //! Computes time-decayed, stake-weighted scores from signed attestations
 //! while resisting Sybil, collusion, and self-dealing attacks.
 
-use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, Vec,
-};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, Vec};
 
 use guildworkman_governance_guard as governance;
 pub use guildworkman_governance_guard::PendingUpgrade;
@@ -170,14 +168,13 @@ impl ReputationContract {
         env: Env,
         admin: Address,
         config: Config,
-        signers: Vec<Address>,
-        threshold: u32,
+        governance_init: governance::GovernanceInit,
     ) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::AlreadyInitialized);
         }
         Self::validate_config(&config)?;
-        governance::init_governance(&env, signers, threshold)?;
+        governance::init_governance(&env, governance_init)?;
 
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Config, &config);
@@ -192,7 +189,11 @@ impl ReputationContract {
     /// be uploaded on the network. Returns `true` if this call's approval
     /// reached the configured threshold, in which case the swap has
     /// already happened — it takes effect after this invocation finishes.
-    pub fn propose_upgrade(env: Env, proposer: Address, wasm_hash: BytesN<32>) -> Result<bool, Error> {
+    pub fn propose_upgrade(
+        env: Env,
+        proposer: Address,
+        wasm_hash: BytesN<32>,
+    ) -> Result<bool, Error> {
         let ready = governance::propose_upgrade(&env, proposer, wasm_hash.clone())?;
         if ready {
             env.deployer().update_current_contract_wasm(wasm_hash);
@@ -203,7 +204,11 @@ impl ReputationContract {
     /// Approves the currently pending upgrade proposal. Returns `true` if
     /// this approval reached the threshold, in which case the swap has
     /// already happened.
-    pub fn approve_upgrade(env: Env, approver: Address, wasm_hash: BytesN<32>) -> Result<bool, Error> {
+    pub fn approve_upgrade(
+        env: Env,
+        approver: Address,
+        wasm_hash: BytesN<32>,
+    ) -> Result<bool, Error> {
         let ready = governance::approve_upgrade(&env, approver, wasm_hash.clone())?;
         if ready {
             env.deployer().update_current_contract_wasm(wasm_hash);
@@ -266,8 +271,7 @@ impl ReputationContract {
         Self::require_admin(&env)?;
         let key = DataKey::Stake(user);
         env.storage().persistent().set(&key, &stake);
-        env
-            .storage()
+        env.storage()
             .persistent()
             .extend_ttl(&key, LEDGERS_THRESHOLD, LEDGERS_EXTEND_TO);
         Ok(())
@@ -322,22 +326,14 @@ impl ReputationContract {
         // 7. Per-reviewer rate limit.
         let window_index = Self::window_index(&env, &config);
         let reviewer_key = DataKey::ReviewerWindow(client.clone(), window_index);
-        let reviewer_count: u32 = env
-            .storage()
-            .temporary()
-            .get(&reviewer_key)
-            .unwrap_or(0);
+        let reviewer_count: u32 = env.storage().temporary().get(&reviewer_key).unwrap_or(0);
         if reviewer_count >= config.reviewer_cap {
             return Err(Error::ReviewerRateLimited);
         }
 
         // 8. Global rate limit.
         let global_key = DataKey::GlobalReviewWindow(window_index);
-        let global_count: u32 = env
-            .storage()
-            .temporary()
-            .get(&global_key)
-            .unwrap_or(0);
+        let global_count: u32 = env.storage().temporary().get(&global_key).unwrap_or(0);
         if global_count >= config.global_cap {
             return Err(Error::GlobalRateLimited);
         }
@@ -354,11 +350,7 @@ impl ReputationContract {
 
         // Store attestation.
         let count_key = DataKey::ReviewCount(worker.clone());
-        let index: u32 = env
-            .storage()
-            .persistent()
-            .get(&count_key)
-            .unwrap_or(0);
+        let index: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
         let attestation = Attestation {
             client: client.clone(),
             worker: worker.clone(),
@@ -385,11 +377,8 @@ impl ReputationContract {
         let weight_contribution = effective_stake as i128 * decay_weight;
 
         let acc_key = DataKey::WeightedScore(worker.clone());
-        let mut acc: WeightedScoreAccumulator = env
-            .storage()
-            .persistent()
-            .get(&acc_key)
-            .unwrap_or_default();
+        let mut acc: WeightedScoreAccumulator =
+            env.storage().persistent().get(&acc_key).unwrap_or_default();
         acc.weighted_sum += weighted_contribution;
         acc.weight_sum += weight_contribution;
         acc.count += 1;
@@ -404,12 +393,16 @@ impl ReputationContract {
         env.storage()
             .temporary()
             .set(&reviewer_key, &(reviewer_count + 1));
-        env.storage().temporary().extend_ttl(&reviewer_key, window_ttl, window_ttl);
+        env.storage()
+            .temporary()
+            .extend_ttl(&reviewer_key, window_ttl, window_ttl);
 
         env.storage()
             .temporary()
             .set(&global_key, &(global_count + 1));
-        env.storage().temporary().extend_ttl(&global_key, window_ttl, window_ttl);
+        env.storage()
+            .temporary()
+            .extend_ttl(&global_key, window_ttl, window_ttl);
 
         Ok(())
     }
@@ -431,10 +424,7 @@ impl ReputationContract {
         worker: Address,
     ) -> Result<WeightedScoreAccumulator, Error> {
         let key = DataKey::WeightedScore(worker);
-        env.storage()
-            .persistent()
-            .get(&key)
-            .ok_or(Error::NoReviews)
+        env.storage().persistent().get(&key).ok_or(Error::NoReviews)
     }
 
     pub fn get_attestation(env: Env, worker: Address, index: u32) -> Option<Attestation> {
@@ -556,7 +546,11 @@ impl ReputationContract {
         }
         let decay = age as i128 * config.decay_rate_bps as i128;
         let weight = SCALE - decay;
-        if weight < 0 { 0 } else { weight }
+        if weight < 0 {
+            0
+        } else {
+            weight
+        }
     }
 
     fn bump_instance(env: &Env) {

@@ -7,7 +7,9 @@
 //! point they are released to the skilled worker. Either party can raise a
 //! dispute, which freezes the funds until the admin (arbiter) resolves it.
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, token, Address, BytesN, Env, Vec};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, token, Address, BytesN, Env, Vec,
+};
 
 use guildworkman_governance_guard as governance;
 pub use guildworkman_governance_guard::PendingUpgrade;
@@ -99,22 +101,27 @@ impl EscrowContract {
     pub fn initialize(
         env: Env,
         admin: Address,
-        signers: Vec<Address>,
-        threshold: u32,
+        governance_init: governance::GovernanceInit,
     ) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::AlreadyInitialized);
         }
         admin.require_auth();
-        governance::init_governance(&env, signers, threshold)?;
+        governance::init_governance(&env, governance_init)?;
         env.storage().instance().set(&DataKey::Admin, &admin);
-        env.storage().instance().extend_ttl(LEDGERS_THRESHOLD, LEDGERS_EXTEND_TO);
+        env.storage()
+            .instance()
+            .extend_ttl(LEDGERS_THRESHOLD, LEDGERS_EXTEND_TO);
         Ok(())
     }
 
     // ----- Upgrade governance -----
 
-    pub fn propose_upgrade(env: Env, proposer: Address, wasm_hash: BytesN<32>) -> Result<bool, Error> {
+    pub fn propose_upgrade(
+        env: Env,
+        proposer: Address,
+        wasm_hash: BytesN<32>,
+    ) -> Result<bool, Error> {
         let ready = governance::propose_upgrade(&env, proposer, wasm_hash.clone())?;
         if ready {
             env.deployer().update_current_contract_wasm(wasm_hash);
@@ -122,7 +129,11 @@ impl EscrowContract {
         Ok(ready)
     }
 
-    pub fn approve_upgrade(env: Env, approver: Address, wasm_hash: BytesN<32>) -> Result<bool, Error> {
+    pub fn approve_upgrade(
+        env: Env,
+        approver: Address,
+        wasm_hash: BytesN<32>,
+    ) -> Result<bool, Error> {
         let ready = governance::approve_upgrade(&env, approver, wasm_hash.clone())?;
         if ready {
             env.deployer().update_current_contract_wasm(wasm_hash);
@@ -292,7 +303,11 @@ impl EscrowContract {
         } else {
             &appointment.worker
         };
-        token_client.transfer(&env.current_contract_address(), recipient, &appointment.amount);
+        token_client.transfer(
+            &env.current_contract_address(),
+            recipient,
+            &appointment.amount,
+        );
 
         appointment.status = Status::Resolved;
         env.storage().persistent().set(&key, &appointment);
