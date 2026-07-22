@@ -11,6 +11,7 @@ marketplace. This workspace has four independent contracts:
 | `reputation` | `contracts/reputation` | Stores one immutable review per completed appointment and keeps a running rating aggregate per skilled worker. |
 | `loyalty-token` | `contracts/loyalty-token` | A SEP-41-style fungible token used to reward clients/workers with points on completed appointments. Only a designated `minter` (the backend's service account) can mint. |
 | `loyalty-emissions` | `contracts/loyalty-emissions` | An emission engine that owns the `loyalty-token`'s `minter` role. Instead of minting rewards in a lump sum, it streams them out of per-account linear vesting schedules, throttled by per-account and global rate limits, and lets the admin reclaim allocations left unclaimed past a deadline. |
+| `governance-guard` | `contracts/governance-guard` | Not a deployed contract — a shared library the four above depend on, providing the multi-sig upgrade/migration pattern described in [Upgrade governance](#upgrade-governance). |
 
 These mirror the domain already implemented server-side in the backend
 ([`../backend-api`](../backend-api): `AppointmentService`, `ReviewService`,
@@ -21,6 +22,7 @@ holding money, recording reviews, issuing rewards — on-chain.
 
 - [Project ecosystem](#project-ecosystem)
 - [Architecture](#architecture)
+- [Upgrade governance](#upgrade-governance)
 - [Prerequisites](#prerequisites)
 - [Build](#build)
 - [Test](#test)
@@ -77,6 +79,62 @@ intended flow, if/when integrated, looks like:
 This requires the backend to hold a Stellar keypair per role (or per user, if
 going non-custodial) and a Soroban RPC client — none of that exists in
 `backend-api/` today.
+
+## Upgrade governance
+
+All four contracts can have their code swapped in place via Soroban's
+`update_current_contract_wasm`, gated behind an M-of-N multi-sig — set once
+at `initialize` via a `signers: Vec<Address>` + `threshold: u32` — instead of
+being controlled by a single key or left permanently immutable. The pattern
+lives in `contracts/governance-guard`, a shared library each contract depends
+on and calls from inside its own methods; it is not itself deployed.
+
+This is deliberately narrow in scope: it only ever gates the ability to swap
+a contract's code and run its post-upgrade migration. It does not replace or
+extend any contract's existing `admin`/`minter` role, and a compromised or
+colluding signer set still cannot resolve disputes, mint tokens, or reclaim
+schedules directly — it can only ship new code that would need to be
+malicious on its own terms to do any of that.
+
+**Flow:**
+
+1. Any signer uploads the new Wasm — `stellar contract upload --wasm ...` —
+   and gets back a hash. (This step doesn't go through governance-guard; it
+   just puts bytes on the ledger, uploading code executes nothing.)
+2. A signer calls `propose_upgrade(proposer, wasm_hash)`. Their approval is
+   recorded immediately.
+3. Other signers call `approve_upgrade(approver, wasm_hash)` until approvals
+   reach `threshold`. **Whichever call — propose or approve — is the one
+   that reaches threshold performs the actual swap in that same
+   transaction** (with a 1-of-N guard, that's `propose_upgrade` itself).
+4. Because a Wasm swap only takes effect after its own invocation finishes,
+   the new code can't run a migration in that same call. A signer calls
+   `migrate(signer)` afterward, in a separate transaction, to run whatever
+   storage transformation the new version needs and advance the recorded
+   storage version. No such transformation exists yet in any contract —
+   `migrate` currently just proves the version-gated path is real and
+   returns `NothingToMigrate` on a fresh deploy, so it's a real place for a
+   future version to land field-by-field changes rather than a promise.
+
+Every contract that adopts this exposes the same six entrypoints —
+`propose_upgrade`, `approve_upgrade`, `cancel_upgrade`, `migrate`, plus
+read-only `get_signers`, `get_upgrade_threshold`, `get_pending_upgrade`,
+`get_storage_version` — on top of whatever it already had. `cancel_upgrade`
+can be called by any single signer, not the full threshold: a minority
+should always be able to block an in-flight upgrade it didn't sign off on,
+even though it takes the full threshold to push one through.
+
+**Known limitation, on purpose:** the signer set and threshold are immutable
+after `initialize` — there is no signer-rotation flow. Rotating signers
+safely (without a majority being able to silently lock out a minority, or
+vice versa) is its own governance design problem, and shipping it alongside
+the upgrade mechanism itself would roughly double the surface being trusted
+in one pass. Left as a deliberate follow-up rather than rushed in here.
+
+Each contract's per-error-code table below lists the governance error
+variants it inherited from `governance-guard`, at whatever numeric offset
+came next in that contract's existing `Error` enum — the variant names are
+identical across all four, only the numbers differ.
 
 ## Prerequisites
 
@@ -167,13 +225,14 @@ stellar contract invoke --id $LOYALTY --source admin --network testnet \
 
 ### escrow
 
-- `initialize(admin: Address)`
+- `initialize(admin: Address, governance_init: GovernanceInit)`
 - `create_appointment(appointment_id: u64, client: Address, worker: Address, token: Address, amount: i128)`
 - `confirm_completion(appointment_id: u64)` — client-only, pays the worker
 - `cancel_appointment(appointment_id: u64)` — client-only, refunds the client
 - `raise_dispute(appointment_id: u64, caller: Address)` — client or worker
 - `resolve_dispute(appointment_id: u64, refund_to_client: bool)` — admin-only
 - `get_appointment(appointment_id: u64) -> Appointment`
+- `propose_upgrade`, `approve_upgrade`, `cancel_upgrade`, `migrate`, `get_signers`, `get_upgrade_threshold`, `get_pending_upgrade`, `get_storage_version` — see [Upgrade governance](#upgrade-governance)
 
 #### Storage layout
 
@@ -193,13 +252,25 @@ stellar contract invoke --id $LOYALTY --source admin --network testnet \
 | `InvalidStatus` | 5 | The requested transition doesn't apply to the appointment's current status (e.g. confirming a non-`Funded` appointment). |
 | `InvalidAmount` | 6 | `amount <= 0` in `create_appointment`. |
 | `NotAParticipant` | 7 | `raise_dispute` called by an address that is neither the client nor the worker. |
+| `GovernanceAlreadyInitialized` | 8 | `initialize` called more than once (surfaced via the governance guard). |
+| `GovernanceNotInitialized` | 9 | A governance call before `initialize`. |
+| `InvalidThreshold` | 10 | `threshold` is `0` or exceeds the number of signers. |
+| `DuplicateSigner` | 11 | The same address appears twice in `signers`. |
+| `NotASigner` | 12 | `propose_upgrade`/`approve_upgrade`/`cancel_upgrade`/`migrate` called by a non-signer. |
+| `NoPendingUpgrade` | 13 | `approve_upgrade`/`cancel_upgrade` with nothing proposed. |
+| `AlreadyApproved` | 14 | The same signer approving the same proposal twice. |
+| `ProposalExpired` | 15 | `approve_upgrade` more than ~7 days after `propose_upgrade`. |
+| `HashMismatch` | 16 | `approve_upgrade` with a hash that doesn't match the pending proposal. |
+| `AlreadyMigrated` | 17 | `migrate` targeting a version already applied or behind the current one. |
+| `NothingToMigrate` | 18 | `migrate` called when the stored version is already current. |
 
 #### CLI usage
 
 ```sh
-# One-time setup
+# One-time setup — a 2-of-3 signer governance guard on top of the admin
 stellar contract invoke --id $ESCROW --source admin --network testnet \
-  -- initialize --admin $ADMIN_ADDR
+  -- initialize --admin $ADMIN_ADDR \
+     --governance_init '{"signers":["'$SIGNER_1'","'$SIGNER_2'","'$SIGNER_3'"],"threshold":2}'
 
 # Client books worker WORKER_ADDR, depositing 10000 units of TOKEN_ADDR, appointment id 1
 stellar contract invoke --id $ESCROW --source client --network testnet \
@@ -228,6 +299,19 @@ stellar contract invoke --id $ESCROW --source admin --network testnet \
 ```
 
 ### reputation
+
+> **This section is stale and predates this change** — it describes a
+> simpler `submit_review`/`Rating{count,sum}` interface that doesn't match
+> `contracts/reputation/src/lib.rs`, which actually has `Config`,
+> `submit_attestation` with stake weighting and time decay, admin-managed
+> stake, and rate limiting. That drift already existed before this PR and
+> rewriting it is unrelated to #16, so it's left alone rather than folded in
+> here — flagging it instead of silently leaving it wrong. What *is* true as
+> of this PR: `initialize` now also takes a `governance_init: GovernanceInit`,
+> and the contract has the same `propose_upgrade`/`approve_upgrade`/
+> `cancel_upgrade`/`migrate` surface described in
+> [Upgrade governance](#upgrade-governance) — see the source and
+> `src/test.rs` for the actual current interface.
 
 - `submit_review(appointment_id: u64, client: Address, worker: Address, rating: u32, comment: String)` — 1-5 stars, one review per `appointment_id`
 - `get_rating(worker: Address) -> Rating { count, sum }`
@@ -274,10 +358,11 @@ stellar contract invoke --id $REPUTATION --source admin --network testnet \
 
 ### loyalty-token
 
-- `initialize(admin: Address, minter: Address, decimals: u32, name: String, symbol: String)`
+- `initialize(admin: Address, minter: Address, decimals: u32, name: String, symbol: String, governance_init: GovernanceInit)`
 - `set_minter(new_minter: Address)` — admin-only
 - `mint(to: Address, amount: i128)` — minter-only
 - `transfer`, `transfer_from`, `approve`, `allowance`, `burn`, `balance`, `decimals`, `name`, `symbol` — standard SEP-41 token surface
+- `propose_upgrade`, `approve_upgrade`, `cancel_upgrade`, `migrate`, `get_signers`, `get_upgrade_threshold`, `get_pending_upgrade`, `get_storage_version` — see [Upgrade governance](#upgrade-governance)
 
 #### Storage layout
 
@@ -299,13 +384,25 @@ stellar contract invoke --id $REPUTATION --source admin --network testnet \
 | `InsufficientAllowance` | 4 | `transfer_from` amount exceeds the spender's remaining allowance. |
 | `InvalidAmount` | 5 | A negative/zero amount passed where a positive amount is required. |
 | `NotAuthorized` | 6 | Reserved for authorization failures; current checks rely on `require_auth()` panicking directly rather than returning this variant. |
+| `GovernanceAlreadyInitialized` | 7 | `initialize` called more than once (surfaced via the governance guard). |
+| `GovernanceNotInitialized` | 8 | A governance call before `initialize`. |
+| `InvalidThreshold` | 9 | `threshold` is `0` or exceeds the number of signers. |
+| `DuplicateSigner` | 10 | The same address appears twice in `signers`. |
+| `NotASigner` | 11 | `propose_upgrade`/`approve_upgrade`/`cancel_upgrade`/`migrate` called by a non-signer. |
+| `NoPendingUpgrade` | 12 | `approve_upgrade`/`cancel_upgrade` with nothing proposed. |
+| `AlreadyApproved` | 13 | The same signer approving the same proposal twice. |
+| `ProposalExpired` | 14 | `approve_upgrade` more than ~7 days after `propose_upgrade`. |
+| `HashMismatch` | 15 | `approve_upgrade` with a hash that doesn't match the pending proposal. |
+| `AlreadyMigrated` | 16 | `migrate` targeting a version already applied or behind the current one. |
+| `NothingToMigrate` | 17 | `migrate` called when the stored version is already current. |
 
 #### CLI usage
 
 ```sh
 stellar contract invoke --id $LOYALTY --source admin --network testnet \
   -- initialize --admin $ADMIN_ADDR --minter $MINTER_ADDR \
-     --decimals 2 --name '"GuildWorkman Points"' --symbol '"GWP"'
+     --decimals 2 --name '"GuildWorkman Points"' --symbol '"GWP"' \
+     --governance_init '{"signers":["'$SIGNER_1'","'$SIGNER_2'","'$SIGNER_3'"],"threshold":2}'
 
 stellar contract invoke --id $LOYALTY --source admin --network testnet \
   -- set_minter --new_minter $NEW_MINTER_ADDR
@@ -348,8 +445,8 @@ An emission engine layered on top of `loyalty-token`. It holds the token's
 lump-sum mints, gated by anti-abuse rate limits, with an admin reclaim path for
 allocations left unclaimed past a deadline.
 
-- `initialize(admin: Address, token: Address, config: Config)` — `config` is
-  `{ window: u32, account_cap: i128, global_cap: i128 }`
+- `initialize(admin: Address, token: Address, config: Config, governance_init: GovernanceInit)` —
+  `config` is `{ window: u32, account_cap: i128, global_cap: i128 }`
 - `create_schedule(beneficiary: Address, total: i128, start: u32, cliff: u32, duration: u32, reclaimable_after: u32)` — admin-only; `start: 0` means "start now"
 - `claim(beneficiary: Address) -> i128` — beneficiary-authorized; mints the
   vested-and-unclaimed amount clamped to the current rate-limit budget, returns
@@ -359,6 +456,7 @@ allocations left unclaimed past a deadline.
 - `vested(beneficiary) -> i128`, `claimable(beneficiary) -> i128`,
   `get_schedule(beneficiary) -> Schedule`, `get_config() -> Config`,
   `get_admin() -> Address`, `get_token() -> Address` — read-only views
+- `propose_upgrade`, `approve_upgrade`, `cancel_upgrade`, `migrate`, `get_signers`, `get_upgrade_threshold`, `get_pending_upgrade`, `get_storage_version` — see [Upgrade governance](#upgrade-governance)
 
 #### Vesting & rate-limit model
 
@@ -402,6 +500,17 @@ the admin can never reclaim allocations that are still vesting.
 | `NotYetReclaimable` | 10 | `reclaim` called before `reclaimable_after`. |
 | `AlreadyReclaimed` | 11 | `claim`/`reclaim` on an already-reclaimed schedule. |
 | `NothingToReclaim` | 12 | `reclaim` when the schedule was already fully claimed. |
+| `GovernanceAlreadyInitialized` | 13 | `initialize` called more than once (surfaced via the governance guard). |
+| `GovernanceNotInitialized` | 14 | A governance call before `initialize`. |
+| `InvalidThreshold` | 15 | `threshold` is `0` or exceeds the number of signers. |
+| `DuplicateSigner` | 16 | The same address appears twice in `signers`. |
+| `NotASigner` | 17 | `propose_upgrade`/`approve_upgrade`/`cancel_upgrade`/`migrate` called by a non-signer. |
+| `NoPendingUpgrade` | 18 | `approve_upgrade`/`cancel_upgrade` with nothing proposed. |
+| `AlreadyApproved` | 19 | The same signer approving the same proposal twice. |
+| `ProposalExpired` | 20 | `approve_upgrade` more than ~7 days after `propose_upgrade`. |
+| `HashMismatch` | 21 | `approve_upgrade` with a hash that doesn't match the pending proposal. |
+| `AlreadyMigrated` | 22 | `migrate` targeting a version already applied or behind the current one. |
+| `NothingToMigrate` | 23 | `migrate` called when the stored version is already current. |
 
 #### Authorization & safety notes
 
@@ -423,7 +532,8 @@ the admin can never reclaim allocations that are still vesting.
 # One-time setup (see the Deploy section for wiring the minter role).
 stellar contract invoke --id $EMISSIONS --source admin --network testnet \
   -- initialize --admin $ADMIN_ADDR --token $LOYALTY_CONTRACT_ID \
-     --config '{ "window": 17280, "account_cap": "1000", "global_cap": "100000" }'
+     --config '{ "window": 17280, "account_cap": "1000", "global_cap": "100000" }' \
+     --governance_init '{"signers":["'$SIGNER_1'","'$SIGNER_2'","'$SIGNER_3'"],"threshold":2}'
 
 # Admin registers a stream: 5000 points vesting over 30 days (starting now),
 # reclaimable after ~31 days if left unclaimed.
@@ -461,20 +571,40 @@ stellar contract invoke --id $EMISSIONS --source admin --network testnet \
 - **Single point of trust for admin.** The `escrow` admin unilaterally
   decides disputes, the `loyalty-token` admin unilaterally controls who can
   mint, and the `loyalty-emissions` admin unilaterally registers and reclaims
-  vesting schedules. All are single-key roles with no timelock, multisig, or
-  on-chain governance — compromising that key compromises the contract. Note
-  `loyalty-emissions` deliberately blocks reclaiming still-vesting funds
+  vesting schedules. All are single-key roles with no timelock or on-chain
+  governance for their day-to-day actions — compromising that key
+  compromises the contract's normal operation. Note `loyalty-emissions`
+  deliberately blocks reclaiming still-vesting funds
   (`reclaimable_after >= start + duration`), so even a compromised admin cannot
   claw back what has already vested to a beneficiary before they claim it.
+  Upgrading a contract's code specifically *is* multi-sig gated (see
+  [Upgrade governance](#upgrade-governance)) — a compromised admin key alone
+  cannot ship new code, only a signer set reaching threshold can — but that
+  guard was scoped narrowly to just the upgrade path, not extended to
+  `admin`'s existing day-to-day powers.
 - **No spam/rate limiting beyond one-review-per-appointment.** `reputation`
   only prevents double-reviewing the same `appointment_id`; it does not
   prevent a client and worker from colluding to create fake appointments
   (that responsibility sits with whatever system calls `create_appointment`
   and `submit_review` with real appointment IDs — today, nothing does, since
   the Java backend isn't integrated yet).
-- **No pause/upgrade mechanism.** None of the three contracts have an
-  emergency pause switch or upgrade path built in; fixing a deployed bug
-  means deploying a new contract and migrating state/callers manually.
+- **Upgrade path exists; pause does not.** All four contracts have a
+  multi-sig-gated code-upgrade and storage-migration path (see
+  [Upgrade governance](#upgrade-governance)) — fixing a deployed bug no
+  longer requires deploying a new contract and migrating callers manually.
+  There's still no emergency pause switch, and the governance signer set is
+  fixed at `initialize` with no rotation flow yet.
+- **The upgrade path's actual Wasm swap is untested by `cargo test`.**
+  `propose_upgrade`/`approve_upgrade` crossing the configured threshold
+  calls `update_current_contract_wasm`, which requires the target hash to
+  already be uploaded on the ledger — there's no such artifact inside a
+  plain unit test run. Every test that exercises the governance flow through
+  a real contract stops one approval short of the threshold on purpose; the
+  underlying threshold/replay/expiry math is covered directly in
+  `contracts/governance-guard`'s own test suite, and the SDK call itself was
+  verified against its documented behavior rather than exercised live. A
+  testnet deploy-and-upgrade dry run is the natural next verification step
+  before this ships anywhere real funds move through.
 - **Comments are not authenticated content.** `reputation`'s `comment` field
   is an arbitrary `String` supplied by the reviewer with no length cap or
   content moderation — treat it as untrusted user input wherever it's
@@ -487,6 +617,14 @@ stellar contract invoke --id $EMISSIONS --source admin --network testnet \
   handle native fiat payments, which stay on Paystack in the existing backend.
 - These contracts have not been audited. Get an independent security review
   before moving any real funds through `escrow` or `loyalty-token` on mainnet.
+- Governance signer rotation. Right now the signer set and threshold are
+  fixed forever at `initialize` — see
+  [Upgrade governance](#upgrade-governance) for why that's a deliberate
+  scope boundary rather than an oversight, and a real candidate for a
+  follow-up issue.
+- Real dispute resolution for `escrow` beyond a single admin call, and a
+  genuine storage migration exercising `migrate`'s version-transform path
+  (nothing has needed one yet — every contract is still on storage version 1).
 
 ## License
 
