@@ -1,6 +1,6 @@
 use super::*;
 use soroban_sdk::testutils::{Address as _, Ledger};
-use soroban_sdk::{Address, Env, String};
+use soroban_sdk::{Address, Env, String, Vec};
 
 // The real deployed token, aliased so it doesn't clash with the local
 // `LoyaltyTokenClient` cross-contract stub declared in `lib.rs`.
@@ -17,6 +17,15 @@ struct Fixture<'a> {
     emissions: LoyaltyEmissionsClient<'a>,
     token: RealLoyaltyTokenClient<'a>,
     admin: Address,
+    signers: Vec<Address>,
+}
+
+fn make_signers(env: &Env, n: u32) -> Vec<Address> {
+    let mut signers = Vec::new(env);
+    for _ in 0..n {
+        signers.push_back(Address::generate(env));
+    }
+    signers
 }
 
 /// Deploy the loyalty token, deploy the emissions engine, and hand the token's
@@ -37,6 +46,10 @@ fn setup<'a>() -> Fixture<'a> {
         &2,
         &String::from_str(&env, "GuildWorkman Points"),
         &String::from_str(&env, "GWP"),
+        &governance::GovernanceInit {
+            signers: make_signers(&env, 1),
+            threshold: 1,
+        },
     );
 
     // Emissions engine.
@@ -47,7 +60,16 @@ fn setup<'a>() -> Fixture<'a> {
         account_cap: ACCOUNT_CAP,
         global_cap: GLOBAL_CAP,
     };
-    emissions.initialize(&admin, &token_id, &config);
+    let signers = make_signers(&env, 3);
+    emissions.initialize(
+        &admin,
+        &token_id,
+        &config,
+        &governance::GovernanceInit {
+            signers: signers.clone(),
+            threshold: 2,
+        },
+    );
 
     // The engine must be the token's minter.
     token.set_minter(&emissions_id);
@@ -57,6 +79,7 @@ fn setup<'a>() -> Fixture<'a> {
         emissions,
         token,
         admin,
+        signers,
     }
 }
 
@@ -87,7 +110,11 @@ fn double_initialize_fails() {
         global_cap: GLOBAL_CAP,
     };
     let token = f.emissions.get_token();
-    let res = f.emissions.try_initialize(&f.admin, &token, &cfg);
+    let gov = governance::GovernanceInit {
+        signers: f.signers.clone(),
+        threshold: 2,
+    };
+    let res = f.emissions.try_initialize(&f.admin, &token, &cfg, &gov);
     assert_eq!(res, Err(Ok(Error::AlreadyInitialized)));
 }
 
@@ -105,8 +132,12 @@ fn initialize_rejects_bad_config() {
         account_cap: ACCOUNT_CAP,
         global_cap: GLOBAL_CAP,
     };
+    let gov = governance::GovernanceInit {
+        signers: make_signers(&env, 1),
+        threshold: 1,
+    };
     assert_eq!(
-        emissions.try_initialize(&admin, &token, &bad),
+        emissions.try_initialize(&admin, &token, &bad, &gov),
         Err(Ok(Error::InvalidConfig))
     );
 }
@@ -280,6 +311,10 @@ fn global_rate_limit_is_a_circuit_breaker() {
         &2,
         &String::from_str(&env, "GuildWorkman Points"),
         &String::from_str(&env, "GWP"),
+        &governance::GovernanceInit {
+            signers: make_signers(&env, 1),
+            threshold: 1,
+        },
     );
 
     let emissions_id = env.register(LoyaltyEmissions, ());
@@ -291,6 +326,10 @@ fn global_rate_limit_is_a_circuit_breaker() {
             window: WINDOW,
             account_cap: 1_000,
             global_cap: 1_500, // only 1.5 accounts' worth per window
+        },
+        &governance::GovernanceInit {
+            signers: make_signers(&env, 1),
+            threshold: 1,
         },
     );
     token.set_minter(&emissions_id);
@@ -495,4 +534,71 @@ fn a_user_cannot_out_claim_their_total_via_many_windows() {
     }
     assert_eq!(total_minted, 2_500);
     assert_eq!(f.token.balance(&user), 2_500);
+}
+
+// ===========================================================================
+// Upgrade governance — see the equivalent block in reputation/src/test.rs
+// for why these all stop one approval short of the configured threshold.
+// ===========================================================================
+
+fn dummy_hash(env: &Env) -> soroban_sdk::BytesN<32> {
+    soroban_sdk::BytesN::from_array(env, &[0u8; 32])
+}
+
+#[test]
+fn initialize_stores_governance_config() {
+    let f = setup();
+    assert_eq!(f.emissions.get_signers(), f.signers);
+    assert_eq!(f.emissions.get_upgrade_threshold(), 2);
+    assert_eq!(f.emissions.get_storage_version(), 1);
+}
+
+#[test]
+fn propose_upgrade_by_non_signer_fails() {
+    let f = setup();
+    let outsider = Address::generate(&f.env);
+    let result = f
+        .emissions
+        .try_propose_upgrade(&outsider, &dummy_hash(&f.env));
+    assert_eq!(result, Err(Ok(Error::NotASigner)));
+}
+
+#[test]
+fn approve_upgrade_below_threshold_is_not_ready() {
+    let f = setup();
+    let target = dummy_hash(&f.env);
+
+    let ready = f
+        .emissions
+        .propose_upgrade(&f.signers.get_unchecked(0), &target);
+    assert!(!ready);
+
+    let pending = f.emissions.get_pending_upgrade().unwrap();
+    assert_eq!(pending.approvals.len(), 1);
+    assert_eq!(pending.wasm_hash, target);
+}
+
+#[test]
+fn cancel_upgrade_by_a_non_approving_signer_still_works() {
+    let f = setup();
+    f.emissions
+        .propose_upgrade(&f.signers.get_unchecked(0), &dummy_hash(&f.env));
+
+    f.emissions.cancel_upgrade(&f.signers.get_unchecked(2));
+    assert!(f.emissions.get_pending_upgrade().is_none());
+}
+
+#[test]
+fn migrate_with_nothing_to_migrate_fails() {
+    let f = setup();
+    let result = f.emissions.try_migrate(&f.signers.get_unchecked(0));
+    assert_eq!(result, Err(Ok(Error::NothingToMigrate)));
+}
+
+#[test]
+fn migrate_by_non_signer_fails() {
+    let f = setup();
+    let outsider = Address::generate(&f.env);
+    let result = f.emissions.try_migrate(&outsider);
+    assert_eq!(result, Err(Ok(Error::NotASigner)));
 }

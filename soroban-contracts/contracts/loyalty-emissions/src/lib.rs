@@ -42,8 +42,15 @@
 //!   event draining emissions faster than intended.
 
 use soroban_sdk::{
-    contract, contractclient, contracterror, contractimpl, contracttype, Address, Env,
+    contract, contractclient, contracterror, contractimpl, contracttype, Address, BytesN, Env, Vec,
 };
+
+use guildworkman_governance_guard as governance;
+pub use guildworkman_governance_guard::PendingUpgrade;
+
+/// Bump when this contract's storage layout actually changes shape and
+/// needs a real transformation in `migrate`. There's no such change yet.
+const CURRENT_STORAGE_VERSION: u32 = 1;
 
 /// Minimal client for the underlying `loyalty-token` contract — just the one
 /// function this engine needs. Declaring it locally (rather than depending on
@@ -125,6 +132,35 @@ pub enum Error {
     NotYetReclaimable = 10,
     AlreadyReclaimed = 11,
     NothingToReclaim = 12,
+    // --- Upgrade governance (see guildworkman-governance-guard) ---
+    GovernanceAlreadyInitialized = 13,
+    GovernanceNotInitialized = 14,
+    InvalidThreshold = 15,
+    DuplicateSigner = 16,
+    NotASigner = 17,
+    NoPendingUpgrade = 18,
+    AlreadyApproved = 19,
+    ProposalExpired = 20,
+    HashMismatch = 21,
+    AlreadyMigrated = 22,
+    NothingToMigrate = 23,
+}
+
+impl From<governance::GovernanceError> for Error {
+    fn from(e: governance::GovernanceError) -> Self {
+        match e {
+            governance::GovernanceError::AlreadyInitialized => Error::GovernanceAlreadyInitialized,
+            governance::GovernanceError::NotInitialized => Error::GovernanceNotInitialized,
+            governance::GovernanceError::InvalidThreshold => Error::InvalidThreshold,
+            governance::GovernanceError::DuplicateSigner => Error::DuplicateSigner,
+            governance::GovernanceError::NotASigner => Error::NotASigner,
+            governance::GovernanceError::NoPendingUpgrade => Error::NoPendingUpgrade,
+            governance::GovernanceError::AlreadyApproved => Error::AlreadyApproved,
+            governance::GovernanceError::ProposalExpired => Error::ProposalExpired,
+            governance::GovernanceError::HashMismatch => Error::HashMismatch,
+            governance::GovernanceError::AlreadyMigrated => Error::AlreadyMigrated,
+        }
+    }
 }
 
 const DAY_IN_LEDGERS: u32 = 17_280;
@@ -151,12 +187,14 @@ impl LoyaltyEmissions {
         admin: Address,
         token: Address,
         config: Config,
+        governance_init: governance::GovernanceInit,
     ) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::AlreadyInitialized);
         }
         admin.require_auth();
         Self::validate_config(&config)?;
+        governance::init_governance(&env, governance_init)?;
 
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Token, &token);
@@ -165,6 +203,62 @@ impl LoyaltyEmissions {
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
         Ok(())
+    }
+
+    // ----- Upgrade governance -----
+
+    pub fn propose_upgrade(
+        env: Env,
+        proposer: Address,
+        wasm_hash: BytesN<32>,
+    ) -> Result<bool, Error> {
+        let ready = governance::propose_upgrade(&env, proposer, wasm_hash.clone())?;
+        if ready {
+            env.deployer().update_current_contract_wasm(wasm_hash);
+        }
+        Ok(ready)
+    }
+
+    pub fn approve_upgrade(
+        env: Env,
+        approver: Address,
+        wasm_hash: BytesN<32>,
+    ) -> Result<bool, Error> {
+        let ready = governance::approve_upgrade(&env, approver, wasm_hash.clone())?;
+        if ready {
+            env.deployer().update_current_contract_wasm(wasm_hash);
+        }
+        Ok(ready)
+    }
+
+    pub fn cancel_upgrade(env: Env, caller: Address) -> Result<(), Error> {
+        governance::cancel_upgrade(&env, caller).map_err(Into::into)
+    }
+
+    pub fn migrate(env: Env, signer: Address) -> Result<(), Error> {
+        governance::require_signer(&env, &signer)?;
+        if governance::current_storage_version(&env) >= CURRENT_STORAGE_VERSION {
+            return Err(Error::NothingToMigrate);
+        }
+        // No storage shape has changed since v1 — nothing to transform yet.
+        governance::mark_migrated(&env, CURRENT_STORAGE_VERSION)?;
+        Ok(())
+    }
+
+    pub fn get_signers(env: Env) -> Vec<Address> {
+        governance::get_signers(&env)
+    }
+
+    pub fn get_upgrade_threshold(env: Env) -> u32 {
+        governance::get_threshold(&env)
+    }
+
+    pub fn get_pending_upgrade(env: Env) -> Option<PendingUpgrade> {
+        governance::get_pending_upgrade(&env)
+    }
+
+    pub fn get_storage_version(env: Env) -> u32 {
+        governance::current_storage_version(&env)
     }
 
     /// Admin-only: register a linear vesting stream for `beneficiary`.
