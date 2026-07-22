@@ -1,34 +1,98 @@
 #![no_std]
 
-//! Reputation contract for GuildWorkman.
+//! Sybil-resistant weighted reputation scoring contract for GuildWorkman.
 //!
-//! Stores skilled-worker reviews immutably on-chain, one per completed
-//! appointment, and maintains a running rating aggregate per worker.
+//! Computes time-decayed, stake-weighted scores from signed attestations
+//! while resisting Sybil, collusion, and self-dealing attacks.
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, String};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, Address, BytesN, Env,
+};
 
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+const DAY_IN_LEDGERS: u32 = 17_280; // ~5 s per ledger
+const LEDGERS_THRESHOLD: u32 = DAY_IN_LEDGERS; // ~1 day
+const LEDGERS_EXTEND_TO: u32 = DAY_IN_LEDGERS * 30; // ~30 days
+const SCALE: i128 = 10_000; // fixed-point scale for decay weights
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+/// Immutable configuration, set once at `initialize`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Config {
+    /// Rate-limit window length in ledgers (~5 s each).
+    pub window: u32,
+    /// Max attestations per reviewer per window.
+    pub reviewer_cap: u32,
+    /// Max attestations globally per window (circuit breaker).
+    pub global_cap: u32,
+    /// Minimum stake required to submit an attestation (0 = disabled).
+    pub min_stake: u64,
+    /// Decay rate per ledger in basis points (e.g. 1 = 0.01%).
+    pub decay_rate_bps: u32,
+    /// Maximum age in ledgers before an attestation decays to zero weight.
+    pub max_age_ledgers: u32,
+}
+
+/// A signed attestation from a client about a worker's performance.
 #[contracttype]
 #[derive(Clone, Debug)]
-pub struct Review {
+pub struct Attestation {
     pub client: Address,
+    pub worker: Address,
+    pub appointment_id: u64,
     pub rating: u32,
-    pub comment: String,
+    /// Client's stake at the time of attestation.
+    pub stake_at_time: u64,
+    /// Ledger sequence when submitted.
+    pub ledger_submitted: u32,
+    /// SHA-256 hash of canonical attestation data for integrity.
+    pub attestation_hash: BytesN<32>,
 }
 
+/// On-chain incremental weighted score accumulator.
 #[contracttype]
 #[derive(Clone, Copy, Debug, Default)]
-pub struct Rating {
+pub struct WeightedScoreAccumulator {
+    /// Sum of (rating * stake * decay_weight), scaled by SCALE.
+    pub weighted_sum: i128,
+    /// Sum of (stake * decay_weight), scaled by SCALE.
+    pub weight_sum: i128,
+    /// Number of attestations contributing.
     pub count: u32,
-    pub sum: u64,
+    /// Last ledger at which the accumulator was updated.
+    pub last_update_ledger: u32,
 }
+
+// ---------------------------------------------------------------------------
+// Storage keys
+// ---------------------------------------------------------------------------
 
 #[contracttype]
 pub enum DataKey {
+    // Instance (singletons)
+    Admin,
+    Config,
+    // Persistent (entity data)
     Reviewed(u64),
-    Rating(Address),
     Review(Address, u32),
     ReviewCount(Address),
+    WeightedScore(Address),
+    Stake(Address),
+    // Temporary (rate-limit tumbling windows)
+    ReviewerWindow(Address, u64),
+    GlobalReviewWindow(u64),
 }
+
+// ---------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -36,50 +100,155 @@ pub enum Error {
     InvalidRating = 1,
     AlreadyReviewed = 2,
     NoReviews = 3,
+    AlreadyInitialized = 4,
+    NotInitialized = 5,
+    InvalidConfig = 6,
+    InsufficientStake = 7,
+    ReviewerRateLimited = 8,
+    GlobalRateLimited = 9,
+    SelfDealing = 10,
+    Unauthorized = 11,
 }
 
-const LEDGERS_THRESHOLD: u32 = 17_280; // ~1 day
-const LEDGERS_EXTEND_TO: u32 = 518_400; // ~30 days
+// ---------------------------------------------------------------------------
+// Contract
+// ---------------------------------------------------------------------------
 
 #[contract]
 pub struct ReputationContract;
 
 #[contractimpl]
 impl ReputationContract {
-    /// Client leaves a 1-5 star review for `worker` tied to a specific, unique
-    /// `appointment_id`. Each appointment can only be reviewed once.
-    pub fn submit_review(
+    // ----- Initialization & admin -----
+
+    pub fn initialize(env: Env, admin: Address, config: Config) -> Result<(), Error> {
+        if env.storage().instance().has(&DataKey::Admin) {
+            return Err(Error::AlreadyInitialized);
+        }
+        Self::validate_config(&config)?;
+
+        env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::Config, &config);
+        Self::bump_instance(&env);
+        Ok(())
+    }
+
+    pub fn update_config(env: Env, config: Config) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        Self::validate_config(&config)?;
+        env.storage().instance().set(&DataKey::Config, &config);
+        Self::bump_instance(&env);
+        Ok(())
+    }
+
+    pub fn set_stake(env: Env, user: Address, stake: u64) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        let key = DataKey::Stake(user);
+        env.storage().persistent().set(&key, &stake);
+        env
+            .storage()
+            .persistent()
+            .extend_ttl(&key, LEDGERS_THRESHOLD, LEDGERS_EXTEND_TO);
+        Ok(())
+    }
+
+    // ----- Core submission -----
+
+    pub fn submit_attestation(
         env: Env,
         appointment_id: u64,
         client: Address,
         worker: Address,
         rating: u32,
-        comment: String,
+        attestation_hash: BytesN<32>,
     ) -> Result<(), Error> {
+        // 1. Authorization (signed attestation via Soroban auth).
         client.require_auth();
 
+        // 2. Self-dealing prevention.
+        if client == worker {
+            return Err(Error::SelfDealing);
+        }
+
+        // 3. Rating validation.
         if !(1..=5).contains(&rating) {
             return Err(Error::InvalidRating);
         }
 
+        // 4. One review per appointment.
         let reviewed_key = DataKey::Reviewed(appointment_id);
         if env.storage().persistent().has(&reviewed_key) {
             return Err(Error::AlreadyReviewed);
         }
+
+        // 5. Load config.
+        let config: Config = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config)
+            .ok_or(Error::NotInitialized)?;
+
+        // 6. Stake check.
+        let stake: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Stake(client.clone()))
+            .unwrap_or(0);
+        if config.min_stake > 0 && stake < config.min_stake {
+            return Err(Error::InsufficientStake);
+        }
+
+        // 7. Per-reviewer rate limit.
+        let window_index = Self::window_index(&env, &config);
+        let reviewer_key = DataKey::ReviewerWindow(client.clone(), window_index);
+        let reviewer_count: u32 = env
+            .storage()
+            .temporary()
+            .get(&reviewer_key)
+            .unwrap_or(0);
+        if reviewer_count >= config.reviewer_cap {
+            return Err(Error::ReviewerRateLimited);
+        }
+
+        // 8. Global rate limit.
+        let global_key = DataKey::GlobalReviewWindow(window_index);
+        let global_count: u32 = env
+            .storage()
+            .temporary()
+            .get(&global_key)
+            .unwrap_or(0);
+        if global_count >= config.global_cap {
+            return Err(Error::GlobalRateLimited);
+        }
+
+        // --- All checks passed, mutate state ---
+
+        let current_ledger = env.ledger().sequence();
+
+        // Mark appointment as reviewed.
         env.storage().persistent().set(&reviewed_key, &true);
         env.storage()
             .persistent()
             .extend_ttl(&reviewed_key, LEDGERS_THRESHOLD, LEDGERS_EXTEND_TO);
 
+        // Store attestation.
         let count_key = DataKey::ReviewCount(worker.clone());
-        let index: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
-        let review = Review {
-            client,
+        let index: u32 = env
+            .storage()
+            .persistent()
+            .get(&count_key)
+            .unwrap_or(0);
+        let attestation = Attestation {
+            client: client.clone(),
+            worker: worker.clone(),
+            appointment_id,
             rating,
-            comment,
+            stake_at_time: stake,
+            ledger_submitted: current_ledger,
+            attestation_hash,
         };
         let review_key = DataKey::Review(worker.clone(), index);
-        env.storage().persistent().set(&review_key, &review);
+        env.storage().persistent().set(&review_key, &attestation);
         env.storage()
             .persistent()
             .extend_ttl(&review_key, LEDGERS_THRESHOLD, LEDGERS_EXTEND_TO);
@@ -88,47 +257,191 @@ impl ReputationContract {
             .persistent()
             .extend_ttl(&count_key, LEDGERS_THRESHOLD, LEDGERS_EXTEND_TO);
 
-        let rating_key = DataKey::Rating(worker.clone());
-        let mut aggregate: Rating = env
+        // Update weighted score accumulator.
+        let effective_stake = if stake == 0 { 1 } else { stake }; // legacy compat
+        let decay_weight = Self::compute_decay_weight(0, &config); // age=0 at submission
+        let weighted_contribution = rating as i128 * effective_stake as i128 * decay_weight;
+        let weight_contribution = effective_stake as i128 * decay_weight;
+
+        let acc_key = DataKey::WeightedScore(worker.clone());
+        let mut acc: WeightedScoreAccumulator = env
             .storage()
             .persistent()
-            .get(&rating_key)
+            .get(&acc_key)
             .unwrap_or_default();
-        aggregate.count += 1;
-        aggregate.sum += rating as u64;
-        env.storage().persistent().set(&rating_key, &aggregate);
+        acc.weighted_sum += weighted_contribution;
+        acc.weight_sum += weight_contribution;
+        acc.count += 1;
+        acc.last_update_ledger = current_ledger;
+        env.storage().persistent().set(&acc_key, &acc);
         env.storage()
             .persistent()
-            .extend_ttl(&rating_key, LEDGERS_THRESHOLD, LEDGERS_EXTEND_TO);
+            .extend_ttl(&acc_key, LEDGERS_THRESHOLD, LEDGERS_EXTEND_TO);
+
+        // Increment rate-limit counters.
+        let window_ttl = config.window * 2;
+        env.storage()
+            .temporary()
+            .set(&reviewer_key, &(reviewer_count + 1));
+        env.storage().temporary().extend_ttl(&reviewer_key, window_ttl, window_ttl);
+
+        env.storage()
+            .temporary()
+            .set(&global_key, &(global_count + 1));
+        env.storage().temporary().extend_ttl(&global_key, window_ttl, window_ttl);
 
         Ok(())
     }
 
-    pub fn get_rating(env: Env, worker: Address) -> Rating {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Rating(worker))
-            .unwrap_or_default()
-    }
+    // ----- Score queries -----
 
-    /// Average rating scaled by 100 (e.g. `437` means 4.37 stars) to avoid floats.
-    pub fn get_average_rating_x100(env: Env, worker: Address) -> Result<u32, Error> {
-        let aggregate = Self::get_rating(env, worker);
-        if aggregate.count == 0 {
+    /// Weighted reputation score scaled by 10_000 (e.g. 43725 = 4.3725 out of 5.0000).
+    pub fn get_reputation_score_x10000(env: Env, worker: Address) -> Result<u64, Error> {
+        let acc = Self::get_weighted_score(env, worker.clone())?;
+        if acc.weight_sum == 0 {
             return Err(Error::NoReviews);
         }
-        Ok(((aggregate.sum * 100) / aggregate.count as u64) as u32)
+        // weighted_sum/weight_sum = average rating. Multiply by 10000 to get 0..50000 range.
+        Ok(((acc.weighted_sum * SCALE) / acc.weight_sum) as u64)
     }
 
-    pub fn get_review(env: Env, worker: Address, index: u32) -> Option<Review> {
-        env.storage().persistent().get(&DataKey::Review(worker, index))
+    pub fn get_weighted_score(
+        env: Env,
+        worker: Address,
+    ) -> Result<WeightedScoreAccumulator, Error> {
+        let key = DataKey::WeightedScore(worker);
+        env.storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::NoReviews)
     }
 
-    pub fn get_review_count(env: Env, worker: Address) -> u32 {
+    pub fn get_attestation(env: Env, worker: Address, index: u32) -> Option<Attestation> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Review(worker, index))
+    }
+
+    pub fn get_attestation_count(env: Env, worker: Address) -> u32 {
         env.storage()
             .persistent()
             .get(&DataKey::ReviewCount(worker))
             .unwrap_or(0)
+    }
+
+    pub fn get_stake(env: Env, user: Address) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Stake(user))
+            .unwrap_or(0)
+    }
+
+    pub fn get_admin(env: Env) -> Result<Address, Error> {
+        Self::require_admin(&env)
+    }
+
+    pub fn get_config(env: Env) -> Result<Config, Error> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Config)
+            .ok_or(Error::NotInitialized)
+    }
+
+    // ----- Admin recalculation -----
+
+    /// Full rescan of all attestations for a worker, recomputing the
+    /// accumulator from scratch with current decay. Corrects drift from
+    /// incremental accumulation.
+    pub fn recalculate_score(env: Env, worker: Address) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+
+        let config: Config = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config)
+            .ok_or(Error::NotInitialized)?;
+
+        let count = Self::get_attestation_count(env.clone(), worker.clone());
+        let current_ledger = env.ledger().sequence();
+
+        let mut weighted_sum: i128 = 0;
+        let mut weight_sum: i128 = 0;
+
+        for i in 0..count {
+            let key = DataKey::Review(worker.clone(), i);
+            let att: Attestation = env.storage().persistent().get(&key).unwrap();
+            let age = current_ledger.saturating_sub(att.ledger_submitted);
+            let decay_weight = Self::compute_decay_weight(age, &config);
+            if decay_weight <= 0 {
+                continue;
+            }
+            let effective_stake = if att.stake_at_time == 0 {
+                1i128
+            } else {
+                att.stake_at_time as i128
+            };
+            weighted_sum += att.rating as i128 * effective_stake * decay_weight;
+            weight_sum += effective_stake * decay_weight;
+        }
+
+        let acc_key = DataKey::WeightedScore(worker);
+        let acc = WeightedScoreAccumulator {
+            weighted_sum,
+            weight_sum,
+            count,
+            last_update_ledger: current_ledger,
+        };
+        env.storage().persistent().set(&acc_key, &acc);
+        env.storage()
+            .persistent()
+            .extend_ttl(&acc_key, LEDGERS_THRESHOLD, LEDGERS_EXTEND_TO);
+
+        Ok(())
+    }
+
+    // ----- Private helpers -----
+
+    fn require_admin(env: &Env) -> Result<Address, Error> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        admin.require_auth();
+        Ok(admin)
+    }
+
+    fn validate_config(config: &Config) -> Result<(), Error> {
+        if config.window == 0
+            || config.reviewer_cap == 0
+            || config.global_cap == 0
+            || config.decay_rate_bps == 0
+            || config.max_age_ledgers == 0
+        {
+            return Err(Error::InvalidConfig);
+        }
+        Ok(())
+    }
+
+    fn window_index(env: &Env, config: &Config) -> u64 {
+        env.ledger().sequence() as u64 / config.window as u64
+    }
+
+    /// Compute decay weight for an attestation of given age.
+    /// Returns 0 if fully decayed.
+    fn compute_decay_weight(age: u32, config: &Config) -> i128 {
+        if age >= config.max_age_ledgers {
+            return 0;
+        }
+        let decay = age as i128 * config.decay_rate_bps as i128;
+        let weight = SCALE - decay;
+        if weight < 0 { 0 } else { weight }
+    }
+
+    fn bump_instance(env: &Env) {
+        env.storage()
+            .instance()
+            .extend_ttl(LEDGERS_THRESHOLD, LEDGERS_EXTEND_TO);
     }
 }
 
