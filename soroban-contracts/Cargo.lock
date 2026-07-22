@@ -729,6 +729,7 @@ dependencies = [
 name = "guildworkman-escrow"
 version = "0.1.0"
 dependencies = [
+ "guildworkman-governance-guard",
  "soroban-sdk",
 ]
 

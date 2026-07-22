@@ -7,7 +7,14 @@
 //! point they are released to the skilled worker. Either party can raise a
 //! dispute, which freezes the funds until the admin (arbiter) resolves it.
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, token, Address, Env};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, token, Address, BytesN, Env, Vec};
+
+use guildworkman_governance_guard as governance;
+pub use guildworkman_governance_guard::PendingUpgrade;
+
+/// Bump when this contract's storage layout actually changes shape and
+/// needs a real transformation in `migrate`. There's no such change yet.
+const CURRENT_STORAGE_VERSION: u32 = 1;
 
 #[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -45,6 +52,35 @@ pub enum Error {
     InvalidStatus = 5,
     InvalidAmount = 6,
     NotAParticipant = 7,
+    // --- Upgrade governance (see guildworkman-governance-guard) ---
+    GovernanceAlreadyInitialized = 8,
+    GovernanceNotInitialized = 9,
+    InvalidThreshold = 10,
+    DuplicateSigner = 11,
+    NotASigner = 12,
+    NoPendingUpgrade = 13,
+    AlreadyApproved = 14,
+    ProposalExpired = 15,
+    HashMismatch = 16,
+    AlreadyMigrated = 17,
+    NothingToMigrate = 18,
+}
+
+impl From<governance::GovernanceError> for Error {
+    fn from(e: governance::GovernanceError) -> Self {
+        match e {
+            governance::GovernanceError::AlreadyInitialized => Error::GovernanceAlreadyInitialized,
+            governance::GovernanceError::NotInitialized => Error::GovernanceNotInitialized,
+            governance::GovernanceError::InvalidThreshold => Error::InvalidThreshold,
+            governance::GovernanceError::DuplicateSigner => Error::DuplicateSigner,
+            governance::GovernanceError::NotASigner => Error::NotASigner,
+            governance::GovernanceError::NoPendingUpgrade => Error::NoPendingUpgrade,
+            governance::GovernanceError::AlreadyApproved => Error::AlreadyApproved,
+            governance::GovernanceError::ProposalExpired => Error::ProposalExpired,
+            governance::GovernanceError::HashMismatch => Error::HashMismatch,
+            governance::GovernanceError::AlreadyMigrated => Error::AlreadyMigrated,
+        }
+    }
 }
 
 const LEDGERS_THRESHOLD: u32 = 17_280; // ~1 day, in ledgers (5s/ledger)
@@ -55,15 +91,73 @@ pub struct EscrowContract;
 
 #[contractimpl]
 impl EscrowContract {
-    /// One-time setup. `admin` acts as the dispute arbiter.
-    pub fn initialize(env: Env, admin: Address) -> Result<(), Error> {
+    /// One-time setup. `admin` acts as the dispute arbiter. `signers`/
+    /// `threshold` configure the M-of-N governance guard that gates
+    /// upgrading this contract's code and running a post-upgrade
+    /// migration — entirely separate from `admin`, which keeps its
+    /// existing power to resolve disputes on its own.
+    pub fn initialize(
+        env: Env,
+        admin: Address,
+        signers: Vec<Address>,
+        threshold: u32,
+    ) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::AlreadyInitialized);
         }
         admin.require_auth();
+        governance::init_governance(&env, signers, threshold)?;
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().extend_ttl(LEDGERS_THRESHOLD, LEDGERS_EXTEND_TO);
         Ok(())
+    }
+
+    // ----- Upgrade governance -----
+
+    pub fn propose_upgrade(env: Env, proposer: Address, wasm_hash: BytesN<32>) -> Result<bool, Error> {
+        let ready = governance::propose_upgrade(&env, proposer, wasm_hash.clone())?;
+        if ready {
+            env.deployer().update_current_contract_wasm(wasm_hash);
+        }
+        Ok(ready)
+    }
+
+    pub fn approve_upgrade(env: Env, approver: Address, wasm_hash: BytesN<32>) -> Result<bool, Error> {
+        let ready = governance::approve_upgrade(&env, approver, wasm_hash.clone())?;
+        if ready {
+            env.deployer().update_current_contract_wasm(wasm_hash);
+        }
+        Ok(ready)
+    }
+
+    pub fn cancel_upgrade(env: Env, caller: Address) -> Result<(), Error> {
+        governance::cancel_upgrade(&env, caller).map_err(Into::into)
+    }
+
+    pub fn migrate(env: Env, signer: Address) -> Result<(), Error> {
+        governance::require_signer(&env, &signer)?;
+        if governance::current_storage_version(&env) >= CURRENT_STORAGE_VERSION {
+            return Err(Error::NothingToMigrate);
+        }
+        // No storage shape has changed since v1 — nothing to transform yet.
+        governance::mark_migrated(&env, CURRENT_STORAGE_VERSION)?;
+        Ok(())
+    }
+
+    pub fn get_signers(env: Env) -> Vec<Address> {
+        governance::get_signers(&env)
+    }
+
+    pub fn get_upgrade_threshold(env: Env) -> u32 {
+        governance::get_threshold(&env)
+    }
+
+    pub fn get_pending_upgrade(env: Env) -> Option<PendingUpgrade> {
+        governance::get_pending_upgrade(&env)
+    }
+
+    pub fn get_storage_version(env: Env) -> u32 {
+        governance::current_storage_version(&env)
     }
 
     /// Client books a skilled worker and deposits `amount` of `token` into escrow.

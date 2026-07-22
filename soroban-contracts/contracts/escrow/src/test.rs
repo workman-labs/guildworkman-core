@@ -27,6 +27,7 @@ struct TestCtx<'a> {
     token: Address,
     token_admin: token::StellarAssetClient<'a>,
     token_client: token::Client<'a>,
+    signers: soroban_sdk::Vec<Address>,
 }
 
 fn setup() -> TestCtx<'static> {
@@ -43,7 +44,12 @@ fn setup() -> TestCtx<'static> {
 
     let contract_id = env.register(EscrowContract, ());
     let contract = EscrowContractClient::new(&env, &contract_id);
-    contract.initialize(&admin);
+
+    let mut signers = soroban_sdk::Vec::new(&env);
+    signers.push_back(Address::generate(&env));
+    signers.push_back(Address::generate(&env));
+    signers.push_back(Address::generate(&env));
+    contract.initialize(&admin, &signers, &2);
 
     TestCtx {
         env,
@@ -54,6 +60,7 @@ fn setup() -> TestCtx<'static> {
         token,
         token_admin,
         token_client,
+        signers,
     }
 }
 
@@ -135,4 +142,71 @@ fn cannot_confirm_twice() {
 
     let result = ctx.contract.try_confirm_completion(&5);
     assert_eq!(result, Err(Ok(Error::InvalidStatus)));
+}
+
+// ===========================================================================
+// Upgrade governance — see the equivalent block in reputation/src/test.rs
+// for why these all stop one approval short of the configured threshold.
+// ===========================================================================
+
+fn dummy_hash(env: &Env) -> soroban_sdk::BytesN<32> {
+    soroban_sdk::BytesN::from_array(env, &[0u8; 32])
+}
+
+#[test]
+fn initialize_stores_governance_config() {
+    let ctx = setup();
+    assert_eq!(ctx.contract.get_signers(), ctx.signers);
+    assert_eq!(ctx.contract.get_upgrade_threshold(), 2);
+    assert_eq!(ctx.contract.get_storage_version(), 1);
+}
+
+#[test]
+fn propose_upgrade_by_non_signer_fails() {
+    let ctx = setup();
+    let outsider = Address::generate(&ctx.env);
+    let result = ctx.contract.try_propose_upgrade(&outsider, &dummy_hash(&ctx.env));
+    assert_eq!(result, Err(Ok(Error::NotASigner)));
+}
+
+#[test]
+fn approve_upgrade_reaches_threshold_after_a_second_distinct_signer() {
+    let ctx = setup();
+    let target = dummy_hash(&ctx.env);
+
+    let ready = ctx.contract.propose_upgrade(&ctx.signers.get_unchecked(0), &target);
+    assert!(!ready);
+
+    // Stop here rather than approving with the second signer — that call
+    // would cross the threshold and attempt the real Wasm swap, which
+    // needs Wasm actually uploaded to the test ledger. Confirm the
+    // proposal is sitting at exactly one approval, awaiting a second.
+    let pending = ctx.contract.get_pending_upgrade().unwrap();
+    assert_eq!(pending.approvals.len(), 1);
+    assert_eq!(pending.wasm_hash, target);
+}
+
+#[test]
+fn cancel_upgrade_by_a_signer_who_never_approved_still_works() {
+    let ctx = setup();
+    ctx.contract
+        .propose_upgrade(&ctx.signers.get_unchecked(0), &dummy_hash(&ctx.env));
+
+    ctx.contract.cancel_upgrade(&ctx.signers.get_unchecked(2));
+    assert!(ctx.contract.get_pending_upgrade().is_none());
+}
+
+#[test]
+fn migrate_with_nothing_to_migrate_fails() {
+    let ctx = setup();
+    let result = ctx.contract.try_migrate(&ctx.signers.get_unchecked(0));
+    assert_eq!(result, Err(Ok(Error::NothingToMigrate)));
+}
+
+#[test]
+fn migrate_by_non_signer_fails() {
+    let ctx = setup();
+    let outsider = Address::generate(&ctx.env);
+    let result = ctx.contract.try_migrate(&outsider);
+    assert_eq!(result, Err(Ok(Error::NotASigner)));
 }
