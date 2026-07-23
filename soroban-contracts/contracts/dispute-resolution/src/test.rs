@@ -20,11 +20,26 @@ const RESOLVE_AT: u32 = 1_201; // after reveal phase
 struct Fixture<'a> {
     env: Env,
     contract: DisputeResolutionClient<'a>,
+    reputation: MockReputationClient<'a>,
     token: token::Client<'a>,
     token_admin: token::StellarAssetClient<'a>,
     admin: Address,
     plaintiff: Address,
     defendant: Address,
+}
+
+#[soroban_sdk::contract]
+pub struct MockReputation;
+
+#[soroban_sdk::contractimpl]
+impl MockReputation {
+    pub fn get_reputation_score_x10000(env: Env, worker: Address) -> u64 {
+        env.storage().instance().get(&worker).unwrap_or(0)
+    }
+    
+    pub fn set_score(env: Env, worker: Address, score: u64) {
+        env.storage().instance().set(&worker, &score);
+    }
 }
 
 fn setup<'a>() -> Fixture<'a> {
@@ -41,6 +56,9 @@ fn setup<'a>() -> Fixture<'a> {
     let token = token::Client::new(&env, &token_address);
     let token_admin = token::StellarAssetClient::new(&env, &token_address);
 
+    let reputation_id = env.register(MockReputation, ());
+    let reputation = MockReputationClient::new(&env, &reputation_id);
+
     let contract_id = env.register(DisputeResolution, ());
     let contract = DisputeResolutionClient::new(&env, &contract_id);
     contract.initialize(
@@ -51,12 +69,16 @@ fn setup<'a>() -> Fixture<'a> {
             min_jurors: MIN_JURORS,
             commit_window: COMMIT_WINDOW,
             reveal_window: REVEAL_WINDOW,
+            reputation_contract: reputation_id.clone(),
+            base_vote_weight: 10_000,
+            close_call_margin_bps: 500,
         },
     );
 
     Fixture {
         env,
         contract,
+        reputation,
         token,
         token_admin,
         admin,
@@ -109,6 +131,8 @@ fn initialize_stores_config() {
     assert_eq!(cfg.min_jurors, MIN_JURORS);
     assert_eq!(cfg.commit_window, COMMIT_WINDOW);
     assert_eq!(cfg.reveal_window, REVEAL_WINDOW);
+    assert_eq!(cfg.base_vote_weight, 10_000);
+    assert_eq!(cfg.close_call_margin_bps, 500);
     assert_eq!(f.contract.get_admin(), f.admin);
 }
 
@@ -124,6 +148,9 @@ fn double_initialize_fails() {
             min_jurors: MIN_JURORS,
             commit_window: COMMIT_WINDOW,
             reveal_window: REVEAL_WINDOW,
+            reputation_contract: f.reputation.address.clone(),
+            base_vote_weight: 10_000,
+            close_call_margin_bps: 500,
         },
     );
     assert_eq!(res, Err(Ok(Error::AlreadyInitialized)));
@@ -148,6 +175,9 @@ fn initialize_rejects_bad_config() {
                 min_jurors: MIN_JURORS,
                 commit_window: COMMIT_WINDOW,
                 reveal_window: REVEAL_WINDOW,
+                reputation_contract: Address::generate(&env),
+                base_vote_weight: 10_000,
+                close_call_margin_bps: 500,
             }
         ),
         Err(Ok(Error::InvalidConfig))
@@ -162,6 +192,9 @@ fn initialize_rejects_bad_config() {
                 min_jurors: 0,
                 commit_window: COMMIT_WINDOW,
                 reveal_window: REVEAL_WINDOW,
+                reputation_contract: Address::generate(&env),
+                base_vote_weight: 10_000,
+                close_call_margin_bps: 500,
             }
         ),
         Err(Ok(Error::InvalidConfig))
@@ -181,6 +214,7 @@ fn open_dispute_sets_deadlines() {
     assert_eq!(d.reveal_deadline, OPEN_AT + COMMIT_WINDOW + REVEAL_WINDOW);
     assert_eq!(d.outcome, Outcome::Undecided);
     assert_eq!(d.juror_count, 0);
+    assert_eq!(d.total_committed_weight, 0);
     assert!(!d.resolved);
 }
 
@@ -240,14 +274,17 @@ fn full_lifecycle_plaintiff_wins() {
     reveal(&f, 1, &j2, true, 12);
     reveal(&f, 1, &j3, false, 13);
 
-    // Resolve: plaintiff wins 2-1.
+    // Resolve: plaintiff wins 2-1. (Weights: 20k to 10k)
+    // Diff is 10k, total is 30k. Margin is 33.3%, > 5% (500 bps), so not a close call.
     set_ledger(&f.env, RESOLVE_AT);
     assert_eq!(f.contract.resolve(&1), Outcome::Plaintiff);
     let d = f.contract.get_dispute(&1);
-    // losers = 1 stake (100) split among 2 winners -> 50 each.
-    assert_eq!(d.reward_per_winner, 50);
+    assert!(!d.is_close_call);
+    assert_eq!(d.total_slashed_pot, 100);
 
-    // Winners reclaim stake + reward; the loser is slashed.
+    // Winners reclaim stake + reward.
+    // Total winning weight = 20,000. Each winner has 10,000 weight.
+    // Reward each = (10_000 * 100) / 20_000 = 50.
     assert_eq!(f.contract.withdraw(&1, &j1), STAKE + 50);
     assert_eq!(f.contract.withdraw(&1, &j2), STAKE + 50);
     assert_eq!(
@@ -317,8 +354,11 @@ fn no_show_juror_is_slashed_and_pot_goes_to_winners() {
     set_ledger(&f.env, RESOLVE_AT);
     assert_eq!(f.contract.resolve(&1), Outcome::Plaintiff);
     let d = f.contract.get_dispute(&1);
-    // losers = 1 (the no-show); pot 100 split 3 ways -> 33 each (1 unit dust).
-    assert_eq!(d.reward_per_winner, 33);
+    // 3 winners, 1 no-show. Not a close call since 3-0.
+    // Total winning weight = 30,000. Each winner has 10,000 weight.
+    // Pot = 100 from no-show.
+    // Reward each = (10_000 * 100) / 30_000 = 33.
+    assert_eq!(d.total_slashed_pot, 100);
 
     assert_eq!(f.contract.withdraw(&1, &j1), STAKE + 33);
     assert_eq!(f.contract.withdraw(&1, &j2), STAKE + 33);
@@ -330,6 +370,83 @@ fn no_show_juror_is_slashed_and_pot_goes_to_winners() {
     );
     // 1 unit of integer-division dust is retained by the contract.
     assert_eq!(f.token.balance(&f.contract.address), 1);
+}
+
+#[test]
+fn close_call_refunds_minority() {
+    let f = setup();
+    open_default(&f, 1);
+
+    let j1 = new_juror(&f);
+    let j2 = new_juror(&f);
+    let j3 = new_juror(&f);
+    let j4 = new_juror(&f); // No-show
+
+    f.reputation.set_score(&j1, &20_000); // 20k, Plaintiff
+    f.reputation.set_score(&j2, &19_000); // 19k, Defendant
+    f.reputation.set_score(&j3, &0);      // 10k (base), Plaintiff
+    f.reputation.set_score(&j4, &0);      // 10k (base), no-show
+
+    // Total Plaintiff: 30k
+    // Total Defendant: 19k
+    // Wait, 30k - 19k = 11k margin. 11k / 49k = 22% (not close).
+    // Let's make it close!
+    // J1: 20k, Plaintiff
+    // J2: 19k, Defendant
+    // J3: 1k, Defendant -> total Defendant = 20k.
+    // Wait, Plaintiff 20k, Defendant 20k is a tie.
+    // Let's do J1: 20k (Plaintiff), J2: 18k (Defendant), J3: 1k (Defendant). Plaintiff wins 20k vs 19k. Margin 1k / 39k = 2.5%.
+    f.reputation.set_score(&j1, &20_000);
+    f.reputation.set_score(&j2, &18_000);
+    f.reputation.set_score(&j3, &1_000); 
+    f.reputation.set_score(&j4, &10_000); // No-show
+
+    // Note: Since base_vote_weight is 10,000, J3's weight will be max(1000, 10000) = 10000!
+    // J2's weight = max(18000, 10000) = 18000.
+    // Defendant total = 18000 + 10000 = 28000.
+    // Plaintiff total (J1) = 20000.
+    // Then Defendant wins 28k to 20k. Margin 8k / 48k = 16.6% (Not close).
+    // Let's set J1: 30_000 (Plaintiff), J2: 29_000 (Defendant), J3: 10_000 (Defendant).
+    // Plaintiff: 30k. Defendant: 39k. Defendant wins by 9k. 9k / 69k = 13% (Not close).
+    // Let's set close_call_margin_bps to a higher value for this test? No, it's set in Config to 500 (5%).
+    // Let's just adjust weights:
+    // J1: 40_000 Plaintiff
+    // J2: 29_000 Defendant
+    // J3: 10_000 Defendant
+    // Plaintiff: 40k. Defendant: 39k. Plaintiff wins! Margin = 1k. Total = 79k. Margin = 1k / 79k = 1.2%. This is close!
+    f.reputation.set_score(&j1, &40_000);
+    f.reputation.set_score(&j2, &29_000);
+    f.reputation.set_score(&j3, &10_000);
+
+    set_ledger(&f.env, COMMIT_AT);
+    commit(&f, 1, &j1, true, 81);
+    commit(&f, 1, &j2, false, 82);
+    commit(&f, 1, &j3, false, 83);
+    commit(&f, 1, &j4, false, 84); // No show
+
+    set_ledger(&f.env, REVEAL_AT);
+    reveal(&f, 1, &j1, true, 81);
+    reveal(&f, 1, &j2, false, 82);
+    reveal(&f, 1, &j3, false, 83);
+
+    set_ledger(&f.env, RESOLVE_AT);
+    assert_eq!(f.contract.resolve(&1), Outcome::Plaintiff);
+
+    let d = f.contract.get_dispute(&1);
+    assert!(d.is_close_call);
+    // Slashed pot should ONLY be J3's stake (100)
+    assert_eq!(d.total_slashed_pot, 100);
+
+    // J1 is the winner, gets stake + reward (100 pot / 1 winner = 100)
+    assert_eq!(f.contract.withdraw(&1, &j1), STAKE + 100);
+    // J2 and J3 are the minority, get refunded because of close call
+    assert_eq!(f.contract.withdraw(&1, &j2), STAKE);
+    assert_eq!(f.contract.withdraw(&1, &j3), STAKE);
+    // J4 is slashed
+    assert_eq!(
+        f.contract.try_withdraw(&1, &j4),
+        Err(Ok(Error::NothingToWithdraw))
+    );
 }
 
 #[test]

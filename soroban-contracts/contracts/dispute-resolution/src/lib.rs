@@ -87,6 +87,12 @@ pub struct Config {
     pub commit_window: u32,
     /// Length of the reveal phase, in ledgers after the commit deadline.
     pub reveal_window: u32,
+    /// Address of the reputation contract.
+    pub reputation_contract: Address,
+    /// Base vote weight for jurors with no reputation.
+    pub base_vote_weight: u64,
+    /// Margin threshold in basis points for close calls (e.g., 500 = 5%).
+    pub close_call_margin_bps: u32,
 }
 
 /// The final verdict of a dispute, set once by `resolve`.
@@ -117,17 +123,28 @@ pub struct Dispute {
     pub commit_deadline: u32,
     /// Last ledger on which `reveal_vote` is accepted.
     pub reveal_deadline: u32,
-    /// Jurors who committed (and staked). Also the slashing denominator.
+    /// Jurors who committed (and staked).
     pub juror_count: u32,
-    /// Revealed votes favoring the plaintiff (`vote == true`).
+    /// Jurors who have revealed their votes.
+    pub revealed_count: u32,
+    /// Total voting weight of all committed jurors.
+    pub total_committed_weight: u64,
+    /// Revealed voting weight favoring the plaintiff (`vote == true`).
+    pub yes_weight: u64,
+    /// Revealed voting weight favoring the defendant (`vote == false`).
+    pub no_weight: u64,
+    /// Number of revealed voters favoring the plaintiff.
     pub yes_count: u32,
-    /// Revealed votes favoring the defendant (`vote == false`).
+    /// Number of revealed voters favoring the defendant.
     pub no_count: u32,
     /// Verdict; `Undecided` until `resolve`.
     pub outcome: Outcome,
-    /// Slashed-pot share each winning juror may withdraw on top of their stake.
-    /// Fixed at `resolve`; `0` for tie/quorum-failure.
-    pub reward_per_winner: i128,
+    /// Indicates if the margin was below `close_call_margin_bps`.
+    pub is_close_call: bool,
+    /// The total amount of staked tokens from slashed jurors.
+    pub total_slashed_pot: i128,
+    /// The total voting weight of the winning side.
+    pub winning_weight: u64,
     /// `true` once `resolve` has run.
     pub resolved: bool,
 }
@@ -138,6 +155,8 @@ pub struct Dispute {
 pub struct Juror {
     /// `sha256(salt || vote_byte || juror_xdr)` submitted during commit.
     pub commitment: BytesN<32>,
+    /// The voting power assigned to this juror based on reputation.
+    pub weight: u64,
     /// Set once the commitment has been successfully revealed.
     pub revealed: bool,
     /// The revealed vote; meaningful only when `revealed`.
@@ -173,6 +192,11 @@ const INSTANCE_BUMP_AMOUNT: u32 = DAY_IN_LEDGERS * 60;
 const INSTANCE_LIFETIME_THRESHOLD: u32 = DAY_IN_LEDGERS * 30;
 const DISPUTE_BUMP_AMOUNT: u32 = DAY_IN_LEDGERS * 30;
 const DISPUTE_LIFETIME_THRESHOLD: u32 = DAY_IN_LEDGERS * 29;
+
+#[soroban_sdk::contractclient(name = "ReputationClient")]
+pub trait Reputation {
+    fn get_reputation_score_x10000(env: Env, worker: Address) -> u64;
+}
 
 #[contract]
 pub struct DisputeResolution;
@@ -240,10 +264,16 @@ impl DisputeResolution {
             commit_deadline,
             reveal_deadline,
             juror_count: 0,
+            revealed_count: 0,
+            total_committed_weight: 0,
+            yes_weight: 0,
+            no_weight: 0,
             yes_count: 0,
             no_count: 0,
             outcome: Outcome::Undecided,
-            reward_per_winner: 0,
+            is_close_call: false,
+            total_slashed_pot: 0,
+            winning_weight: 0,
             resolved: false,
         };
         env.storage().persistent().set(&key, &dispute);
@@ -280,7 +310,6 @@ impl DisputeResolution {
             return Err(Error::AlreadyCommitted);
         }
 
-        // Pull the juror's stake into the contract's own balance.
         let config = Self::read_config(&env);
         let token = Self::read_token(&env);
         token::Client::new(&env, &token).transfer(
@@ -289,8 +318,16 @@ impl DisputeResolution {
             &config.juror_stake,
         );
 
+        let rep_client = ReputationClient::new(&env, &config.reputation_contract);
+        let rep_score = match rep_client.try_get_reputation_score_x10000(&juror) {
+            Ok(Ok(score)) => score,
+            _ => 0,
+        };
+        let weight = core::cmp::max(rep_score, config.base_vote_weight);
+
         let record = Juror {
             commitment,
+            weight,
             revealed: false,
             vote: false,
             withdrawn: false,
@@ -299,6 +336,7 @@ impl DisputeResolution {
         Self::bump_dispute(&env, &juror_key);
 
         dispute.juror_count = dispute.juror_count.saturating_add(1);
+        dispute.total_committed_weight = dispute.total_committed_weight.saturating_add(weight);
         env.storage().persistent().set(&dispute_key, &dispute);
         Self::bump_dispute(&env, &dispute_key);
         Self::bump_instance(&env);
@@ -349,10 +387,13 @@ impl DisputeResolution {
         Self::bump_dispute(&env, &juror_key);
 
         if vote {
+            dispute.yes_weight = dispute.yes_weight.saturating_add(record.weight);
             dispute.yes_count = dispute.yes_count.saturating_add(1);
         } else {
+            dispute.no_weight = dispute.no_weight.saturating_add(record.weight);
             dispute.no_count = dispute.no_count.saturating_add(1);
         }
+        dispute.revealed_count = dispute.revealed_count.saturating_add(1);
         env.storage().persistent().set(&dispute_key, &dispute);
         Self::bump_dispute(&env, &dispute_key);
         Self::bump_instance(&env);
@@ -378,32 +419,60 @@ impl DisputeResolution {
         }
 
         let config = Self::read_config(&env);
-        let revealed = dispute.yes_count.saturating_add(dispute.no_count);
+        let total_revealed_weight = dispute.yes_weight.saturating_add(dispute.no_weight);
 
-        let (outcome, winner_count) = if revealed < config.min_jurors {
-            (Outcome::QuorumFailed, 0u32)
-        } else if dispute.yes_count > dispute.no_count {
-            (Outcome::Plaintiff, dispute.yes_count)
-        } else if dispute.no_count > dispute.yes_count {
-            (Outcome::Defendant, dispute.no_count)
-        } else {
-            (Outcome::Tie, 0u32)
-        };
-
-        // For a decided outcome, losers = every staker who is not a winning
-        // voter (minority voters *and* no-shows). Their stakes form the pot,
-        // split evenly among the winners. Integer division may leave dust in the
-        // contract; it is never over-distributed.
-        let reward_per_winner = if winner_count > 0 {
-            let losers = dispute.juror_count.saturating_sub(winner_count) as i128;
-            let pot = losers.saturating_mul(config.juror_stake);
-            pot / winner_count as i128
-        } else {
+        // Calculate margin (scaled by 10,000 for basis points)
+        let margin_bps = if total_revealed_weight == 0 {
             0
+        } else {
+            let diff = if dispute.yes_weight > dispute.no_weight {
+                dispute.yes_weight - dispute.no_weight
+            } else {
+                dispute.no_weight - dispute.yes_weight
+            };
+            (diff as u128 * 10_000 / total_revealed_weight as u128) as u32
         };
+
+        let is_close_call = margin_bps <= config.close_call_margin_bps;
+        
+        let outcome = if dispute.revealed_count < config.min_jurors {
+            Outcome::QuorumFailed
+        } else if dispute.yes_weight > dispute.no_weight {
+            Outcome::Plaintiff
+        } else if dispute.no_weight > dispute.yes_weight {
+            Outcome::Defendant
+        } else {
+            Outcome::Tie
+        };
+
+        let winning_weight = match outcome {
+            Outcome::Plaintiff => dispute.yes_weight,
+            Outcome::Defendant => dispute.no_weight,
+            _ => 0,
+        };
+
+        let winning_count = match outcome {
+            Outcome::Plaintiff => dispute.yes_count,
+            Outcome::Defendant => dispute.no_count,
+            _ => 0,
+        };
+
+        let mut total_slashed_pot: i128 = 0;
+        if winning_weight > 0 {
+            let no_shows_count = dispute.juror_count.saturating_sub(dispute.revealed_count) as i128;
+            total_slashed_pot += no_shows_count.saturating_mul(config.juror_stake);
+
+            if !is_close_call {
+                // Not a close call: minority is also slashed
+                let minority_count = dispute.revealed_count.saturating_sub(winning_count) as i128;
+                total_slashed_pot += minority_count.saturating_mul(config.juror_stake);
+            }
+        }
 
         dispute.outcome = outcome;
-        dispute.reward_per_winner = reward_per_winner;
+        dispute.is_close_call = is_close_call;
+        dispute.total_slashed_pot = total_slashed_pot;
+        dispute.winning_weight = winning_weight;
         dispute.resolved = true;
         env.storage().persistent().set(&dispute_key, &dispute);
         Self::bump_dispute(&env, &dispute_key);
@@ -443,10 +512,27 @@ impl DisputeResolution {
         let payout = match dispute.outcome {
             Outcome::Plaintiff | Outcome::Defendant => {
                 let winning_vote = dispute.outcome == Outcome::Plaintiff;
-                if record.revealed && record.vote == winning_vote {
-                    config.juror_stake + dispute.reward_per_winner
+                if record.revealed {
+                    if record.vote == winning_vote {
+                        // Winner: gets stake + proportional share of slashed pot
+                        let reward = if dispute.winning_weight > 0 {
+                            (record.weight as i128 * dispute.total_slashed_pot) / dispute.winning_weight as i128
+                        } else {
+                            0
+                        };
+                        config.juror_stake + reward
+                    } else {
+                        // Minority voter
+                        if dispute.is_close_call {
+                            // Refunded
+                            config.juror_stake
+                        } else {
+                            // Slashed
+                            return Err(Error::NothingToWithdraw);
+                        }
+                    }
                 } else {
-                    // Slashed: minority voter or no-show. Stake stays in the pot.
+                    // No-show is always slashed
                     return Err(Error::NothingToWithdraw);
                 }
             }
