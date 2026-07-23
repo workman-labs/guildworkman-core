@@ -36,7 +36,7 @@ impl MockReputation {
     pub fn get_reputation_score_x10000(env: Env, worker: Address) -> u64 {
         env.storage().instance().get(&worker).unwrap_or(0)
     }
-    
+
     pub fn set_score(env: Env, worker: Address, score: u64) {
         env.storage().instance().set(&worker, &score);
     }
@@ -384,8 +384,8 @@ fn close_call_refunds_minority() {
 
     f.reputation.set_score(&j1, &20_000); // 20k, Plaintiff
     f.reputation.set_score(&j2, &19_000); // 19k, Defendant
-    f.reputation.set_score(&j3, &0);      // 10k (base), Plaintiff
-    f.reputation.set_score(&j4, &0);      // 10k (base), no-show
+    f.reputation.set_score(&j3, &0); // 10k (base), Plaintiff
+    f.reputation.set_score(&j4, &0); // 10k (base), no-show
 
     // Total Plaintiff: 30k
     // Total Defendant: 19k
@@ -398,7 +398,7 @@ fn close_call_refunds_minority() {
     // Let's do J1: 20k (Plaintiff), J2: 18k (Defendant), J3: 1k (Defendant). Plaintiff wins 20k vs 19k. Margin 1k / 39k = 2.5%.
     f.reputation.set_score(&j1, &20_000);
     f.reputation.set_score(&j2, &18_000);
-    f.reputation.set_score(&j3, &1_000); 
+    f.reputation.set_score(&j3, &1_000);
     f.reputation.set_score(&j4, &10_000); // No-show
 
     // Note: Since base_vote_weight is 10,000, J3's weight will be max(1000, 10000) = 10000!

@@ -425,16 +425,12 @@ impl DisputeResolution {
         let margin_bps = if total_revealed_weight == 0 {
             0
         } else {
-            let diff = if dispute.yes_weight > dispute.no_weight {
-                dispute.yes_weight - dispute.no_weight
-            } else {
-                dispute.no_weight - dispute.yes_weight
-            };
+            let diff = dispute.yes_weight.abs_diff(dispute.no_weight);
             (diff as u128 * 10_000 / total_revealed_weight as u128) as u32
         };
 
         let is_close_call = margin_bps <= config.close_call_margin_bps;
-        
+
         let outcome = if dispute.revealed_count < config.min_jurors {
             Outcome::QuorumFailed
         } else if dispute.yes_weight > dispute.no_weight {
@@ -516,7 +512,8 @@ impl DisputeResolution {
                     if record.vote == winning_vote {
                         // Winner: gets stake + proportional share of slashed pot
                         let reward = if dispute.winning_weight > 0 {
-                            (record.weight as i128 * dispute.total_slashed_pot) / dispute.winning_weight as i128
+                            (record.weight as i128 * dispute.total_slashed_pot)
+                                / dispute.winning_weight as i128
                         } else {
                             0
                         };
