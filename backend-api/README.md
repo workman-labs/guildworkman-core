@@ -222,6 +222,24 @@ runtime stage (`openjdk:17`) copying the packaged jar.
 All endpoints are prefixed `/api/v1/...`. Responses are wrapped in a common
 `ApiResponse { data, success }` envelope unless noted.
 
+An interactive OpenAPI/Swagger UI is served at `/swagger-ui.html`
+(spec at `/v3/api-docs`).
+
+### `AuthController` — `/api/v1/auth`
+
+JWT authentication, RBAC, and rotating refresh tokens. Full design notes:
+[`docs/AUTHENTICATION.md`](docs/AUTHENTICATION.md).
+
+| Method | Path | Auth | Purpose |
+|---|---|---|---|
+| POST | `/register` | public | Create an account, returns an access + refresh token pair |
+| POST | `/login` | public | Authenticate, returns a token pair |
+| POST | `/refresh` | refresh token | Rotate to a new token pair (revokes the old one; reuse revokes the session) |
+| POST | `/logout` | refresh token | Revoke the refresh token's whole family |
+| GET | `/me` | access token | The authenticated caller's identity |
+
+`/api/v1/admin/**` requires the `ADMIN` role (see `AdminController`).
+
 ### `ClientController` — `/api/v1/client`
 
 | Method | Path | Purpose |
