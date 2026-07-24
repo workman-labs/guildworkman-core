@@ -46,7 +46,7 @@ use soroban_sdk::{
 };
 
 use guildworkman_governance_guard as governance;
-pub use guildworkman_governance_guard::PendingUpgrade;
+pub use guildworkman_governance_guard::{PendingRotation, PendingUpgrade};
 
 /// Bump when this contract's storage layout actually changes shape and
 /// needs a real transformation in `migrate`. There's no such change yet.
@@ -144,6 +144,13 @@ pub enum Error {
     HashMismatch = 21,
     AlreadyMigrated = 22,
     NothingToMigrate = 23,
+    // --- Signer rotation (see guildworkman-governance-guard) ---
+    NoPendingRotation = 24,
+    RotationMismatch = 25,
+    RotationNotReady = 26,
+    RotationTimelockActive = 27,
+    RotationExpired = 28,
+    RotationInProgress = 29,
 }
 
 impl From<governance::GovernanceError> for Error {
@@ -159,6 +166,12 @@ impl From<governance::GovernanceError> for Error {
             governance::GovernanceError::ProposalExpired => Error::ProposalExpired,
             governance::GovernanceError::HashMismatch => Error::HashMismatch,
             governance::GovernanceError::AlreadyMigrated => Error::AlreadyMigrated,
+            governance::GovernanceError::NoPendingRotation => Error::NoPendingRotation,
+            governance::GovernanceError::RotationMismatch => Error::RotationMismatch,
+            governance::GovernanceError::RotationNotReady => Error::RotationNotReady,
+            governance::GovernanceError::RotationTimelockActive => Error::RotationTimelockActive,
+            governance::GovernanceError::RotationExpired => Error::RotationExpired,
+            governance::GovernanceError::RotationInProgress => Error::RotationInProgress,
         }
     }
 }
@@ -233,6 +246,45 @@ impl LoyaltyEmissions {
 
     pub fn cancel_upgrade(env: Env, caller: Address) -> Result<(), Error> {
         governance::cancel_upgrade(&env, caller).map_err(Into::into)
+    }
+
+    // ----- Signer rotation -----
+
+    /// Opens a timelocked proposal to rotate the governance signer set and
+    /// threshold, authorized by the current signers at the current
+    /// threshold. Reaching threshold only *schedules* the rotation;
+    /// `execute_signer_rotation` applies it after the timelock. Returns
+    /// `true` if this call reached threshold.
+    pub fn propose_signer_rotation(
+        env: Env,
+        proposer: Address,
+        new_signers: Vec<Address>,
+        new_threshold: u32,
+    ) -> Result<bool, Error> {
+        governance::propose_signer_rotation(&env, proposer, new_signers, new_threshold)
+            .map_err(Into::into)
+    }
+
+    /// Approves the pending signer rotation. Returns `true` when this
+    /// approval reaches threshold and schedules the rotation.
+    pub fn approve_signer_rotation(
+        env: Env,
+        approver: Address,
+        new_signers: Vec<Address>,
+        new_threshold: u32,
+    ) -> Result<bool, Error> {
+        governance::approve_signer_rotation(&env, approver, new_signers, new_threshold)
+            .map_err(Into::into)
+    }
+
+    /// Applies a scheduled rotation once its timelock has elapsed. Any
+    /// current signer may trigger it.
+    pub fn execute_signer_rotation(env: Env, caller: Address) -> Result<(), Error> {
+        governance::execute_signer_rotation(&env, caller).map_err(Into::into)
+    }
+
+    pub fn get_pending_rotation(env: Env) -> Option<PendingRotation> {
+        governance::get_pending_rotation(&env)
     }
 
     pub fn migrate(env: Env, signer: Address) -> Result<(), Error> {
