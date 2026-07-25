@@ -5,6 +5,7 @@ import com.fasterxml.jackson.datatype.jsr310.deser.LocalDateTimeDeserializer;
 import com.guildworkman.api.data.constants.AppointmentStatus;
 import com.guildworkman.api.data.constants.Category;
 import com.guildworkman.api.data.models.Client;
+import jakarta.validation.constraints.NotNull;
 import lombok.Getter;
 import lombok.Setter;
 import java.math.BigDecimal;
@@ -14,10 +15,13 @@ import java.time.LocalDateTime;
 @Getter
 public class BookAppointmentRequest {
 
+    @NotNull
     private Long clientId;
     private AppointmentStatus status;
+    @NotNull
     @JsonDeserialize(using = LocalDateTimeDeserializer.class)
     private LocalDateTime scheduleTime;
+    @NotNull
     private Category category;
 
     /**

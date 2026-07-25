@@ -6,11 +6,15 @@ import com.guildworkman.api.dto.responses.ApiResponse;
 import com.guildworkman.api.dto.responses.ConsultationResponse;
 import com.guildworkman.api.services.ServiceUtils.ClientService;
 import com.guildworkman.api.services.ServiceUtils.ConsultationService;
+import jakarta.validation.Valid;
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.NotNull;
 import lombok.AllArgsConstructor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.validation.annotation.Validated;
 import org.springframework.web.bind.annotation.*;
 
 import java.time.LocalDateTime;
@@ -22,6 +26,7 @@ import static org.springframework.http.HttpStatus.CREATED;
 @RestController
 @RequestMapping("/api/v1/client")
 @AllArgsConstructor
+@Validated
 public class ClientController {
 
     private static final Logger log = LoggerFactory.getLogger(ClientController.class);
@@ -30,14 +35,14 @@ public class ClientController {
 
 
     @PostMapping("/bookAppointment")
-    public ResponseEntity<?>bookAppointment(@RequestBody BookAppointmentRequest bookAppointmentRequest){
+    public ResponseEntity<?>bookAppointment(@Valid @RequestBody BookAppointmentRequest bookAppointmentRequest){
         return ResponseEntity.status(CREATED)
                 .body(new ApiResponse
                         (clientService.bookAppointment(bookAppointmentRequest),true));
     }
 
     @PostMapping("/registerClient")
-    public ResponseEntity<?> registerClient(@RequestBody RegistrationRequest registrationRequest){
+    public ResponseEntity<?> registerClient(@Valid @RequestBody RegistrationRequest registrationRequest){
 //        log.info("Registering Client => {}", registrationRequest.toString());
         return ResponseEntity.status(CREATED)
                .body(new ApiResponse
@@ -50,27 +55,27 @@ public class ClientController {
     // `id` param (the *client* id) and failed with "The given id must not be
     // null" for every caller that sent just appointmentId.
     @PutMapping("/cancelAppointment")
-    public ResponseEntity<?> cancelAppointment(@RequestParam Long appointmentId){
+    public ResponseEntity<?> cancelAppointment(@RequestParam @NotNull Long appointmentId){
         return ResponseEntity.status(HttpStatus.OK)
                .body(new ApiResponse
                         (clientService.cancelAppointment(appointmentId),true));
     }
 
     @PutMapping("/updateAppointment")
-    public ResponseEntity<?> updateAppointment(@RequestParam Long appointmentId, @RequestBody UpdateAppointmentRequest request){
+    public ResponseEntity<?> updateAppointment(@RequestParam @NotNull Long appointmentId, @Valid @RequestBody UpdateAppointmentRequest request){
         return ResponseEntity.status(HttpStatus.OK)
                .body(new ApiResponse
                         (clientService.updateAppointment(appointmentId, request),true));
     }
     @DeleteMapping("/deleteAppointment")
-    public ResponseEntity<?> deleteAppointment(@RequestParam Long appointmentId){
+    public ResponseEntity<?> deleteAppointment(@RequestParam @NotNull Long appointmentId){
         return ResponseEntity.status(HttpStatus.OK)
                .body(new ApiResponse
                         (clientService.deleteAppointment(appointmentId),true));
     }
 
     @GetMapping("/viewAllAppointment")
-    public ResponseEntity<?> viewAllAppointment(@RequestParam Long clientId){
+    public ResponseEntity<?> viewAllAppointment(@RequestParam @NotNull Long clientId){
         // A read returns 200 OK, not 201 CREATED.
         return ResponseEntity.status(HttpStatus.OK)
                .body(new ApiResponse
@@ -78,13 +83,13 @@ public class ClientController {
     }
 
     @PutMapping("/updateClientProfile")
-    public ResponseEntity<?> updateClientProfile(@RequestBody UpdateClientRequest request) {
+    public ResponseEntity<?> updateClientProfile(@Valid @RequestBody UpdateClientRequest request) {
         return ResponseEntity
                 .ok(new ApiResponse(clientService.updateClientProfile(request), true));
     }
 
     @PostMapping("/login")
-    public ResponseEntity<?> login(@RequestBody LoginRequest loginRequest){
+    public ResponseEntity<?> login(@Valid @RequestBody LoginRequest loginRequest){
         return ResponseEntity.status(CREATED)
                 .body(new ApiResponse(clientService.login(loginRequest),true));
     }
@@ -95,15 +100,15 @@ public class ClientController {
     }
     @PostMapping("/consult")
     public ResponseEntity<ConsultationResponse> bookConsultation(
-            @RequestParam Long clientId,
-            @RequestParam Long workerId,
-            @RequestParam String details) {
+            @RequestParam @NotNull Long clientId,
+            @RequestParam @NotNull Long workerId,
+            @RequestParam @NotBlank String details) {
         ConsultationResponse response = consultationService.bookConsultation(clientId, workerId, details);
         return new ResponseEntity<>(response, HttpStatus.CREATED);
     }
     @PostMapping("/{consultationId}/availability")
     public ResponseEntity<ConsultationAvailability> scheduleAvailability(
-            @PathVariable Long consultationId,
+            @PathVariable @NotNull Long consultationId,
             @RequestParam LocalDateTime clientAvailability,
             @RequestParam LocalDateTime workerAvailability) {
         ConsultationAvailability availability = consultationService.scheduleAvailability(

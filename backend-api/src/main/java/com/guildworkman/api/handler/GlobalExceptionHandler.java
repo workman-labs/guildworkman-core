@@ -1,102 +1,177 @@
 package com.guildworkman.api.handler;
 
 import com.guildworkman.api.exceptions.*;
-import org.jetbrains.annotations.NotNull;
+import jakarta.validation.ConstraintViolationException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.HttpStatusCode;
+import org.springframework.http.ProblemDetail;
 import org.springframework.http.ResponseEntity;
+import org.springframework.http.converter.HttpMessageNotReadableException;
+import org.springframework.security.access.AccessDeniedException;
 import org.springframework.security.core.AuthenticationException;
 import org.springframework.validation.FieldError;
+import org.springframework.web.HttpRequestMethodNotSupportedException;
 import org.springframework.web.bind.MethodArgumentNotValidException;
+import org.springframework.web.bind.MissingServletRequestParameterException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.context.request.WebRequest;
+import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
+import org.springframework.web.servlet.mvc.method.annotation.ResponseEntityExceptionHandler;
 
 import java.util.LinkedHashMap;
 import java.util.Map;
 
-import static org.springframework.http.HttpStatus.BAD_REQUEST;
-import static org.springframework.http.HttpStatus.CONFLICT;
-import static org.springframework.http.HttpStatus.UNAUTHORIZED;
-
+/**
+ * Central error contract for the API: every exception raised inside a controller
+ * or during request binding/validation is rendered as an RFC 7807
+ * (application/problem+json) body — {@code type/title/status/detail}, plus a
+ * {@code errors} extension for field/parameter-level validation failures.
+ *
+ * <p>401/403 raised by the Spring Security filter chain (before the
+ * DispatcherServlet) are out of reach here; they're rendered in the same shape
+ * by {@link com.guildworkman.api.security.RestAuthenticationEntryPoint} and
+ * {@link com.guildworkman.api.security.RestAccessDeniedHandler}.
+ */
 @RestControllerAdvice
-public class GlobalExceptionHandler {
+public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
 
-    // --- Authentication & RBAC (issue #23) -------------------------------
-    // All auth errors keep the shared {error, success:false} contract, but map
-    // to accurate status codes instead of a blanket 400.
+    private static final Logger log = LoggerFactory.getLogger(GlobalExceptionHandler.class);
+
+    // --- Domain exceptions ------------------------------------------------
 
     @ExceptionHandler(EmailAlreadyExistsException.class)
-    public ResponseEntity<?> handleEmailExists(EmailAlreadyExistsException exception) {
-        return ResponseEntity.status(CONFLICT)
-                .body(Map.of("error", exception.getMessage(), "success", false));
+    public ProblemDetail handleEmailExists(EmailAlreadyExistsException exception) {
+        return ProblemDetails.of(HttpStatus.CONFLICT, "email-already-exists",
+                "Email already registered", exception.getMessage());
     }
 
     @ExceptionHandler(TokenRefreshException.class)
-    public ResponseEntity<?> handleTokenRefresh(TokenRefreshException exception) {
-        return ResponseEntity.status(UNAUTHORIZED)
-                .body(Map.of("error", exception.getMessage(), "success", false));
+    public ProblemDetail handleTokenRefresh(TokenRefreshException exception) {
+        return ProblemDetails.of(HttpStatus.UNAUTHORIZED, "invalid-refresh-token",
+                "Refresh token rejected", exception.getMessage());
     }
 
     @ExceptionHandler(AuthenticationException.class)
-    public ResponseEntity<?> handleAuthentication(AuthenticationException exception) {
+    public ProblemDetail handleAuthentication(AuthenticationException exception) {
         // Uniform message so we don't leak whether it was the email or password
         // that was wrong.
-        return ResponseEntity.status(UNAUTHORIZED)
-                .body(Map.of("error", "Invalid email or password", "success", false));
+        return ProblemDetails.of(HttpStatus.UNAUTHORIZED, "invalid-credentials",
+                "Authentication failed", "Invalid email or password");
     }
 
-    @ExceptionHandler(MethodArgumentNotValidException.class)
-    public ResponseEntity<?> handleValidation(MethodArgumentNotValidException exception) {
-        Map<String, Object> fieldErrors = new LinkedHashMap<>();
-        for (FieldError error : exception.getBindingResult().getFieldErrors()) {
-            fieldErrors.put(error.getField(), error.getDefaultMessage());
-        }
-        Map<String, Object> body = new LinkedHashMap<>();
-        body.put("error", "Validation failed");
-        body.put("fieldErrors", fieldErrors);
-        body.put("success", false);
-        return ResponseEntity.status(BAD_REQUEST).body(body);
+    @ExceptionHandler(AccessDeniedException.class)
+    public ProblemDetail handleAccessDenied(AccessDeniedException exception) {
+        return ProblemDetails.of(HttpStatus.FORBIDDEN, "access-denied",
+                "Access denied", "You do not have permission to perform this action");
     }
 
     @ExceptionHandler(UserNotFoundException.class)
-    public ResponseEntity<?>handleUserNotFound(UserNotFoundException exception){
-        return ResponseEntity.status(BAD_REQUEST)
-                .body(Map.of(
-                        "error", exception.getMessage(),
-                        "success", false));
+    public ProblemDetail handleUserNotFound(UserNotFoundException exception) {
+        return ProblemDetails.of(HttpStatus.NOT_FOUND, "user-not-found",
+                "User not found", exception.getMessage());
     }
+
     @ExceptionHandler(AppointmentNotFoundException.class)
-    public ResponseEntity<?> handleAppointmentNotFound(AppointmentNotFoundException exception){
-        return ResponseEntity.status(BAD_REQUEST)
-                .body(Map.of(
-                        "error", exception.getMessage(),
-                        "success", false));
+    public ProblemDetail handleAppointmentNotFound(AppointmentNotFoundException exception) {
+        return ProblemDetails.of(HttpStatus.NOT_FOUND, "appointment-not-found",
+                "Appointment not found", exception.getMessage());
     }
 
-    @ExceptionHandler(Exception.class)
-    public ResponseEntity<?> handleGlobalException(Exception exception){
-        return ResponseEntity.status(BAD_REQUEST)
-               .body(Map.of(
-                        "error", exception.getMessage(),
-                        "success", false));
-    }
-    @ExceptionHandler(GuildWorkmanException.class)
-    public ResponseEntity<?> handleGuildWorkmanException(GuildWorkmanException exception){
-        return ResponseEntity.status(BAD_REQUEST)
-                .body(Map.of(
-                        "error", exception.getMessage(),
-                        "success", false));
-
-    }
     @ExceptionHandler(InvalidPasswordException.class)
-    public ResponseEntity<?>handleInvalidPasswordException(@NotNull InvalidPasswordException exception){
-        return ResponseEntity.status(BAD_REQUEST)
-                .body(Map.of("error", exception.getMessage(),
-                        "success", false));
+    public ProblemDetail handleInvalidPasswordException(InvalidPasswordException exception) {
+        return ProblemDetails.of(HttpStatus.BAD_REQUEST, "invalid-password",
+                "Invalid password", exception.getMessage());
     }
 
     @ExceptionHandler(InvalidEmailFoundException.class)
-    public ResponseEntity<?>handleInvalidEmailFoundException(InvalidEmailFoundException exception){
-        return ResponseEntity.status(BAD_REQUEST)
-                .body(Map.of("error", exception.getMessage(),
-                        "success", false));
+    public ProblemDetail handleInvalidEmailFoundException(InvalidEmailFoundException exception) {
+        return ProblemDetails.of(HttpStatus.BAD_REQUEST, "invalid-email",
+                "Invalid email", exception.getMessage());
+    }
+
+    @ExceptionHandler(GuildWorkmanException.class)
+    public ProblemDetail handleGuildWorkmanException(GuildWorkmanException exception) {
+        return ProblemDetails.of(HttpStatus.BAD_REQUEST, "bad-request",
+                "Request could not be processed", exception.getMessage());
+    }
+
+    // --- Bean validation ----------------------------------------------------
+
+    /** Validation failures on {@code @RequestParam}/{@code @PathVariable} (needs {@code @Validated} on the controller). */
+    @ExceptionHandler(ConstraintViolationException.class)
+    public ProblemDetail handleConstraintViolation(ConstraintViolationException exception) {
+        Map<String, String> errors = new LinkedHashMap<>();
+        exception.getConstraintViolations().forEach(violation ->
+                errors.put(violation.getPropertyPath().toString(), violation.getMessage()));
+        ProblemDetail problemDetail = ProblemDetails.of(HttpStatus.BAD_REQUEST, "constraint-violation",
+                "Constraint violation", "One or more request parameters are invalid");
+        problemDetail.setProperty("errors", errors);
+        return problemDetail;
+    }
+
+    @ExceptionHandler(MethodArgumentTypeMismatchException.class)
+    public ProblemDetail handleTypeMismatch(MethodArgumentTypeMismatchException exception) {
+        String requiredType = exception.getRequiredType() != null
+                ? exception.getRequiredType().getSimpleName()
+                : "a different type";
+        ProblemDetail problemDetail = ProblemDetails.of(HttpStatus.BAD_REQUEST, "type-mismatch",
+                "Invalid parameter type",
+                "Parameter '%s' should be of type %s".formatted(exception.getName(), requiredType));
+        return problemDetail;
+    }
+
+    /** Validation failures on {@code @Valid @RequestBody} DTOs. */
+    @Override
+    protected ResponseEntity<Object> handleMethodArgumentNotValid(
+            MethodArgumentNotValidException exception, HttpHeaders headers,
+            HttpStatusCode status, WebRequest request) {
+        Map<String, String> errors = new LinkedHashMap<>();
+        for (FieldError error : exception.getBindingResult().getFieldErrors()) {
+            errors.put(error.getField(), error.getDefaultMessage());
+        }
+        ProblemDetail problemDetail = ProblemDetails.of(HttpStatus.BAD_REQUEST, "validation-error",
+                "Validation failed", "One or more fields failed validation");
+        problemDetail.setProperty("errors", errors);
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(problemDetail);
+    }
+
+    @Override
+    protected ResponseEntity<Object> handleHttpMessageNotReadable(
+            HttpMessageNotReadableException exception, HttpHeaders headers,
+            HttpStatusCode status, WebRequest request) {
+        ProblemDetail problemDetail = ProblemDetails.of(HttpStatus.BAD_REQUEST, "malformed-request",
+                "Malformed request body", "The request body is missing or could not be parsed");
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(problemDetail);
+    }
+
+    @Override
+    protected ResponseEntity<Object> handleMissingServletRequestParameter(
+            MissingServletRequestParameterException exception, HttpHeaders headers,
+            HttpStatusCode status, WebRequest request) {
+        ProblemDetail problemDetail = ProblemDetails.of(HttpStatus.BAD_REQUEST, "missing-parameter",
+                "Missing request parameter", exception.getMessage());
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(problemDetail);
+    }
+
+    @Override
+    protected ResponseEntity<Object> handleHttpRequestMethodNotSupported(
+            HttpRequestMethodNotSupportedException exception, HttpHeaders headers,
+            HttpStatusCode status, WebRequest request) {
+        ProblemDetail problemDetail = ProblemDetails.of(HttpStatus.METHOD_NOT_ALLOWED, "method-not-allowed",
+                "Method not allowed", exception.getMessage());
+        return ResponseEntity.status(HttpStatus.METHOD_NOT_ALLOWED).body(problemDetail);
+    }
+
+    // --- Fallback -------------------------------------------------------------
+
+    @ExceptionHandler(Exception.class)
+    public ProblemDetail handleGlobalException(Exception exception) {
+        log.error("Unhandled exception", exception);
+        return ProblemDetails.of(HttpStatus.INTERNAL_SERVER_ERROR, "internal-error",
+                "Internal server error", "An unexpected error occurred. Please try again later.");
     }
 }
