@@ -12,6 +12,7 @@ import jakarta.validation.constraints.NotNull;
 import lombok.AllArgsConstructor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.format.annotation.DateTimeFormat;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.validation.annotation.Validated;
@@ -109,8 +110,8 @@ public class ClientController {
     @PostMapping("/{consultationId}/availability")
     public ResponseEntity<ConsultationAvailability> scheduleAvailability(
             @PathVariable @NotNull Long consultationId,
-            @RequestParam LocalDateTime clientAvailability,
-            @RequestParam LocalDateTime workerAvailability) {
+            @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE_TIME) LocalDateTime clientAvailability,
+            @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE_TIME) LocalDateTime workerAvailability) {
         ConsultationAvailability availability = consultationService.scheduleAvailability(
                 consultationId, clientAvailability, workerAvailability);
         return new ResponseEntity<>(availability, HttpStatus.CREATED);
