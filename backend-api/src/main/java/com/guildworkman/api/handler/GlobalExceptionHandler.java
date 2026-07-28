@@ -1,5 +1,6 @@
 package com.guildworkman.api.handler;
 
+import com.guildworkman.api.escrow.service.EscrowOrchestrationNotFoundException;
 import com.guildworkman.api.exceptions.*;
 import jakarta.validation.ConstraintViolationException;
 import org.slf4j.Logger;
@@ -87,6 +88,12 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
     public ResponseEntity<ProblemDetail> handleAppointmentNotFound(AppointmentNotFoundException exception) {
         return respond(HttpStatus.NOT_FOUND, "appointment-not-found",
                 "Appointment not found", exception.getMessage());
+    }
+
+    @ExceptionHandler(EscrowOrchestrationNotFoundException.class)
+    public ResponseEntity<ProblemDetail> handleEscrowOrchestrationNotFound(EscrowOrchestrationNotFoundException exception) {
+        return respond(HttpStatus.NOT_FOUND, "escrow-orchestration-not-found",
+                "Escrow orchestration request not found", exception.getMessage());
     }
 
     @ExceptionHandler(InvalidPasswordException.class)

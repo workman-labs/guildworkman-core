@@ -18,4 +18,5 @@ public interface OnChainEventRepository extends JpaRepository<OnChainEvent, Long
     List<OnChainEvent> claimNext(@Param("statuses") Set<ChainEventStatus> statuses, @Param("now") Instant now, Pageable pageable);
     List<OnChainEvent> findByLedgerBetweenOrderByContractIdAscLedgerAscEventIndexAsc(long fromLedger, long toLedger);
     long countByStatus(ChainEventStatus status);
+    List<OnChainEvent> findByContractIdAndTopicsContaining(String contractId, String topicFragment);
 }

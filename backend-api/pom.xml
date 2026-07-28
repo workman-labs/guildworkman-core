@@ -164,6 +164,35 @@
 					</excludes>
 				</configuration>
 			</plugin>
+			<plugin>
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-surefire-plugin</artifactId>
+				<configuration>
+					<!--
+					    Background @Scheduled pollers (chain-event ingestion, escrow
+					    orchestration) default to a 1s delay. Every @SpringBootTest spins
+					    up its own ApplicationContext, and Spring caches those contexts,
+					    including their live scheduler threads, for the rest of this test
+					    JVM's life. A @SpringBootTest class that doesn't explicitly
+					    disable scheduling leaves a poller running against the shared
+					    test database indefinitely, racing with whatever test class runs
+					    next and stealing/mutating its rows.
+
+					    Defaulting the delays to effectively "off" here means only tests
+					    that explicitly want a poller running opt into it, via their own
+					    @SpringBootTest(properties = ...). Inline test properties take
+					    precedence over these system properties, so
+					    ChainEventServiceIntegrationTest and
+					    EscrowOrchestrationIntegrationTest are unaffected.
+					-->
+					<systemPropertyVariables>
+						<chain.events.poll-delay-ms>3600000</chain.events.poll-delay-ms>
+						<escrow.orchestration.submit-poll-delay-ms>3600000</escrow.orchestration.submit-poll-delay-ms>
+						<escrow.orchestration.confirm-poll-delay-ms>3600000</escrow.orchestration.confirm-poll-delay-ms>
+						<escrow.reconciliation.poll-delay-ms>3600000</escrow.reconciliation.poll-delay-ms>
+					</systemPropertyVariables>
+				</configuration>
+			</plugin>
 		</plugins>
 	</build>
 
