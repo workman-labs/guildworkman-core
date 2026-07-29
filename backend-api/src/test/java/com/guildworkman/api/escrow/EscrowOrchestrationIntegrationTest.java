@@ -78,9 +78,10 @@ class EscrowOrchestrationIntegrationTest {
 
     @Test
     void submitCreatesAPendingRequest() {
-        var resp = orchestrationService.submit(submitRequest(key("k1"), "1"));
+        var outcome = orchestrationService.submit(submitRequest(key("k1"), "1"));
+        assertThat(outcome.replayed()).isFalse();
 
-        var saved = orchestrationRequests.findById(resp.getId()).orElseThrow();
+        var saved = orchestrationRequests.findById(outcome.request().getId()).orElseThrow();
         assertThat(saved.getStatus()).isEqualTo(OrchestrationStatus.PENDING);
         assertThat(saved.getReconciliationStatus()).isEqualTo(ReconciliationStatus.PENDING);
     }
@@ -91,7 +92,9 @@ class EscrowOrchestrationIntegrationTest {
         var first = orchestrationService.submit(submitRequest(idemKey, "1"));
         var second = orchestrationService.submit(submitRequest(idemKey, "1"));
 
-        assertThat(second.getId()).isEqualTo(first.getId());
+        assertThat(first.replayed()).isFalse();
+        assertThat(second.replayed()).isTrue();
+        assertThat(second.request().getId()).isEqualTo(first.request().getId());
         assertThat(orchestrationRequests.count()).isEqualTo(1);
     }
 
@@ -102,7 +105,7 @@ class EscrowOrchestrationIntegrationTest {
         ExecutorService pool = Executors.newFixedThreadPool(threads);
         List<Callable<Long>> tasks = new java.util.ArrayList<>();
         for (int i = 0; i < threads; i++) {
-            tasks.add(() -> orchestrationService.submit(submitRequest(idemKey, "1")).getId());
+            tasks.add(() -> orchestrationService.submit(submitRequest(idemKey, "1")).request().getId());
         }
 
         List<Future<Long>> futures = pool.invokeAll(tasks, 30, TimeUnit.SECONDS);
@@ -121,7 +124,7 @@ class EscrowOrchestrationIntegrationTest {
 
     @Test
     void fullLifecycleFromSubmitToConfirmed() {
-        var resp = orchestrationService.submit(submitRequest(key("lifecycle"), "7"));
+        var resp = orchestrationService.submit(submitRequest(key("lifecycle"), "7")).request();
         when(sorobanRpcClient.sendTransaction(any())).thenReturn(new SendTransactionResult("hash-1", "PENDING", null));
 
         orchestrationService.submitPending();
@@ -137,13 +140,13 @@ class EscrowOrchestrationIntegrationTest {
         assertThat(confirmed.getConfirmedAt()).isNotNull();
     }
 
-    // Mirrors EscrowOrchestrationService.MAX_ATTEMPTS (package-private; not
-    // visible from this package).
+    // Mirrors EscrowOrchestrationRetryProperties' default maxAttempts (this
+    // test doesn't override escrow.orchestration.retry.max-attempts).
     private static final int MAX_ATTEMPTS = 5;
 
     @Test
     void rpcFailureAppliesBackoffThenDeadLetter() {
-        var resp = orchestrationService.submit(submitRequest(key("dl"), "9"));
+        var resp = orchestrationService.submit(submitRequest(key("dl"), "9")).request();
         // Force nextAttemptAt into the past and attempts near the ceiling so the
         // very next failure trips DEAD_LETTER without looping through backoff delays.
         EscrowOrchestrationRequest entity = orchestrationRequests.findById(resp.getId()).orElseThrow();
@@ -161,7 +164,7 @@ class EscrowOrchestrationIntegrationTest {
 
     @Test
     void pessimisticLockingPreventsDoubleSubmission() throws Exception {
-        var resp = orchestrationService.submit(submitRequest(key("concurrent"), "3"));
+        var resp = orchestrationService.submit(submitRequest(key("concurrent"), "3")).request();
         when(sorobanRpcClient.sendTransaction(any())).thenReturn(new SendTransactionResult("hash-x", "PENDING", null));
 
         int threads = 8;

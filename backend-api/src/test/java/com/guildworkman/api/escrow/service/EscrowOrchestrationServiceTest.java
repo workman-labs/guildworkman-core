@@ -27,6 +27,7 @@ class EscrowOrchestrationServiceTest {
     private EscrowOrchestrationRequestRepository repository;
     private EscrowOrchestrationInserter inserter;
     private SorobanRpcClient sorobanRpcClient;
+    private EscrowOrchestrationRetryProperties retryProperties;
     private EscrowOrchestrationService service;
 
     @BeforeEach
@@ -34,7 +35,8 @@ class EscrowOrchestrationServiceTest {
         repository = mock(EscrowOrchestrationRequestRepository.class);
         inserter = mock(EscrowOrchestrationInserter.class);
         sorobanRpcClient = mock(SorobanRpcClient.class);
-        service = new EscrowOrchestrationService(repository, inserter, sorobanRpcClient);
+        retryProperties = new EscrowOrchestrationRetryProperties();
+        service = new EscrowOrchestrationService(repository, inserter, sorobanRpcClient, retryProperties);
     }
 
     private static SubmitOrchestrationRequest request(String key) {
@@ -65,7 +67,8 @@ class EscrowOrchestrationServiceTest {
 
         var result = service.submit(req);
 
-        assertThat(result.getId()).isEqualTo(1L);
+        assertThat(result.request().getId()).isEqualTo(1L);
+        assertThat(result.replayed()).isFalse();
         verify(inserter).insert(req);
     }
 
@@ -77,7 +80,8 @@ class EscrowOrchestrationServiceTest {
 
         var result = service.submit(req);
 
-        assertThat(result.getId()).isEqualTo(1L);
+        assertThat(result.request().getId()).isEqualTo(1L);
+        assertThat(result.replayed()).isTrue();
         verify(inserter, never()).insert(any());
     }
 
@@ -91,7 +95,8 @@ class EscrowOrchestrationServiceTest {
 
         var result = service.submit(req);
 
-        assertThat(result.getId()).isEqualTo(9L);
+        assertThat(result.request().getId()).isEqualTo(9L);
+        assertThat(result.replayed()).isTrue();
     }
 
     @Test
@@ -154,13 +159,13 @@ class EscrowOrchestrationServiceTest {
     @Test
     void submitOneMovesToDeadLetterAfterMaxAttempts() {
         var e = entity(1L, "k", OrchestrationStatus.PENDING);
-        e.setAttempts(EscrowOrchestrationService.MAX_ATTEMPTS - 1);
+        e.setAttempts(retryProperties.getMaxAttempts() - 1);
         when(sorobanRpcClient.sendTransaction(any())).thenThrow(new SorobanRpcException("timeout"));
 
         service.submitOne(e);
 
         assertThat(e.getStatus()).isEqualTo(OrchestrationStatus.DEAD_LETTER);
-        assertThat(e.getAttempts()).isEqualTo(EscrowOrchestrationService.MAX_ATTEMPTS);
+        assertThat(e.getAttempts()).isEqualTo(retryProperties.getMaxAttempts());
     }
 
     @Test
@@ -217,7 +222,7 @@ class EscrowOrchestrationServiceTest {
     void pollOneMovesToDeadLetterAfterMaxAttemptsNotFound() {
         var e = entity(1L, "k", OrchestrationStatus.SUBMITTED);
         e.setSorobanTxHash("hash123");
-        e.setAttempts(EscrowOrchestrationService.MAX_ATTEMPTS - 1);
+        e.setAttempts(retryProperties.getMaxAttempts() - 1);
         when(sorobanRpcClient.getTransaction("hash123")).thenReturn(new GetTransactionResult("NOT_FOUND", null, null));
 
         service.pollOne(e);

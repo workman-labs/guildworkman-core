@@ -3,6 +3,7 @@ package com.guildworkman.api.escrow.api;
 import com.guildworkman.api.escrow.model.EscrowOperationType;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Pattern;
 import jakarta.validation.constraints.Size;
 
 /**
@@ -18,6 +19,9 @@ public record SubmitOrchestrationRequest(
         @NotBlank @Size(max = 128) String idempotencyKey,
         @NotNull EscrowOperationType operationType,
         @NotBlank @Size(max = 128) String contractId,
-        @NotBlank @Size(max = 128) String operationRef,
+        // No '"' allowed: EscrowReconciliationService matches this value as a
+        // literal JSON-quoted substring against ingested event topics, so a
+        // stray quote could make it match (or fail to match) unrelated events.
+        @NotBlank @Size(max = 128) @Pattern(regexp = "[^\"]*", message = "must not contain '\"'") String operationRef,
         @NotBlank String signedTransactionXdr) {
 }

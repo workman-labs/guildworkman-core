@@ -53,10 +53,22 @@ public class EscrowReconciliationService {
     }
 
     void reconcileOne(EscrowOrchestrationRequest entity) {
+        // OnChainEvent.topics is a JSON-encoded string column (see
+        // ChainEventInserter), not a normalized list, so matching a specific
+        // topic value means matching its literal JSON-quoted form as a
+        // substring — e.g. operationRef "42" must appear as `"42"` inside
+        // something like `["42","Completed"]`. This is a LIKE %..% query
+        // (OnChainEventRepository#findByContractIdAndTopicsContaining); the
+        // quotes keep it from misfiring on a numeric prefix ("4" won't match
+        // "42"). SubmitOrchestrationRequest rejects a literal '"' in
+        // operationRef so it can't break out of this quoting.
         String topicFragment = "\"" + entity.getOperationRef() + "\"";
         List<OnChainEvent> matches = onChainEvents.findByContractIdAndTopicsContaining(
                 entity.getContractId(), topicFragment);
 
+        // PROCESSED (not just "ingested") because a PENDING/PROCESSING event
+        // might still fail its own retries and never actually reflect this
+        // operation having taken effect — see ChainEventService.
         boolean corroborated = matches.stream().anyMatch(e -> e.getStatus() == ChainEventStatus.PROCESSED);
         if (corroborated) {
             entity.setReconciliationStatus(ReconciliationStatus.MATCHED);
@@ -69,6 +81,10 @@ public class EscrowReconciliationService {
                 ? entity.getConfirmedAt().plus(properties.getWindow())
                 : Instant.now();
         if (Instant.now().isAfter(deadline)) {
+            // Terminal: MISMATCHED is not automatically retried by this sweep
+            // (findByStatusAndReconciliationStatus only selects PENDING). See
+            // docs/ESCROW_ORCHESTRATION.md "Operations" for how to force a
+            // recheck once the indexer catches up.
             entity.setReconciliationStatus(ReconciliationStatus.MISMATCHED);
             entity.setReconciledAt(Instant.now());
             orchestrationRequests.save(entity);

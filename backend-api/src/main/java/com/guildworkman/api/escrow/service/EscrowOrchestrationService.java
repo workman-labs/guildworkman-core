@@ -19,6 +19,7 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Instant;
 import java.util.EnumSet;
+import java.util.concurrent.ThreadLocalRandom;
 
 /**
  * Submits and confirms escrow-contract operations over Soroban RPC.
@@ -26,6 +27,9 @@ import java.util.EnumSet;
  * <p><b>Idempotency</b> — {@link #submit} dedupes on {@code idempotencyKey}:
  * resubmitting the same key returns the original request instead of creating
  * a second one, so a client-side retry of the REST call never double-submits.
+ * See {@link EscrowOrchestrationInserter} for why the insert itself needs a
+ * nested transaction, and how that compares to an optimistic
+ * compare-and-swap.
  *
  * <p><b>Exactly-once</b> — is achieved compositely, not by any single lock:
  * <ol>
@@ -40,6 +44,15 @@ import java.util.EnumSet;
  *       hash — resubmitting identical XDR comes back {@code DUPLICATE} with
  *       the same hash rather than executing twice.</li>
  * </ol>
+ *
+ * <p><b>Backoff</b> — retry delay doubles from {@code retryProperties.baseDelay}
+ * each attempt up to {@code retryProperties.maxDelay}, then is randomized by
+ * {@code +/- retryProperties.jitter} so a batch of requests that failed
+ * together don't all retry in the same instant and hammer Soroban RPC again
+ * (a thundering herd). A request that exhausts {@code retryProperties.maxAttempts}
+ * moves to {@link OrchestrationStatus#DEAD_LETTER} — an operator needs to
+ * look at {@code lastError} and either fix the underlying cause and requeue
+ * it, or discard it.
  */
 @Service
 @RequiredArgsConstructor
@@ -47,16 +60,26 @@ public class EscrowOrchestrationService {
 
     private static final Logger log = LoggerFactory.getLogger(EscrowOrchestrationService.class);
 
-    static final int MAX_ATTEMPTS = 5;
-
     private final EscrowOrchestrationRequestRepository repository;
     private final EscrowOrchestrationInserter inserter;
     private final SorobanRpcClient sorobanRpcClient;
+    private final EscrowOrchestrationRetryProperties retryProperties;
 
+    /**
+     * @return the (possibly pre-existing) request for {@code request.idempotencyKey()},
+     * tagged with whether this call created it or returned an existing one
+     * (see {@link SubmitOutcome#replayed()}). Callers that only need the entity
+     * can use {@link SubmitOutcome#request()}.
+     */
     @Transactional(readOnly = true)
-    public EscrowOrchestrationRequest submit(SubmitOrchestrationRequest request) {
+    public SubmitOutcome submit(SubmitOrchestrationRequest request) {
         return repository.findByIdempotencyKey(request.idempotencyKey())
+                .map(existing -> new SubmitOutcome(existing, true))
                 .orElseGet(() -> insertIdempotently(request));
+    }
+
+    /** @param replayed true if {@code request} already existed for this idempotency key. */
+    public record SubmitOutcome(EscrowOrchestrationRequest request, boolean replayed) {
     }
 
     @Transactional(readOnly = true)
@@ -64,15 +87,22 @@ public class EscrowOrchestrationService {
         return repository.findById(id).orElseThrow(() -> new EscrowOrchestrationNotFoundException(id));
     }
 
-    private EscrowOrchestrationRequest insertIdempotently(SubmitOrchestrationRequest request) {
+    private SubmitOutcome insertIdempotently(SubmitOrchestrationRequest request) {
         try {
-            return inserter.insert(request);
+            EscrowOrchestrationRequest created = inserter.insert(request);
+            log.info("Escrow orchestration request created id={} operationType={} operationRef={}",
+                    created.getId(), created.getOperationType(), created.getOperationRef());
+            return new SubmitOutcome(created, false);
         } catch (DataIntegrityViolationException ex) {
-            // Nested REQUIRES_NEW insert rolled back; outer TX can still read the winner.
-            return repository.findByIdempotencyKey(request.idempotencyKey())
+            // Lost the unique-key race: another concurrent call for the same
+            // idempotency key won. The nested REQUIRES_NEW insert rolled back
+            // on its own, so the outer (read-only) transaction can still read
+            // the winner — this call is a replay too, just one that raced.
+            EscrowOrchestrationRequest winner = repository.findByIdempotencyKey(request.idempotencyKey())
                     .orElseThrow(() -> new IllegalStateException(
                             "Orchestration request not found after idempotent-guard violation for key="
                                     + request.idempotencyKey(), ex));
+            return new SubmitOutcome(winner, true);
         }
     }
 
@@ -94,6 +124,8 @@ public class EscrowOrchestrationService {
                 entity.setNextAttemptAt(Instant.now());
                 entity.setLastError(null);
                 repository.save(entity);
+                log.info("Escrow orchestration request id={} submitted sorobanTxHash={} attempts={}",
+                        entity.getId(), entity.getSorobanTxHash(), entity.getAttempts());
             } else if (result.isRetryable()) {
                 scheduleRetry(entity, "Soroban RPC busy (TRY_AGAIN_LATER)");
             } else {
@@ -119,6 +151,8 @@ public class EscrowOrchestrationService {
                 entity.setConfirmedAt(Instant.now());
                 entity.setLastError(null);
                 repository.save(entity);
+                log.info("Escrow orchestration request id={} confirmed sorobanTxHash={} ledger={}",
+                        entity.getId(), entity.getSorobanTxHash(), result.ledger());
             } else if (result.isFailed()) {
                 // The on-chain transaction was rejected; the signed envelope's
                 // sequence number is consumed, so resubmitting it can never
@@ -126,25 +160,28 @@ public class EscrowOrchestrationService {
                 entity.setStatus(OrchestrationStatus.FAILED);
                 entity.setLastError("Soroban transaction failed on-chain: " + result.resultXdr());
                 repository.save(entity);
+                log.warn("Escrow orchestration request id={} failed on-chain sorobanTxHash={}",
+                        entity.getId(), entity.getSorobanTxHash());
             } else {
                 // NOT_FOUND: not yet ingested by RPC's ledger view. Keep polling.
                 entity.setAttempts(entity.getAttempts() + 1);
-                if (entity.getAttempts() >= MAX_ATTEMPTS) {
-                    entity.setStatus(OrchestrationStatus.DEAD_LETTER);
-                    entity.setLastError("Gave up waiting for transaction confirmation after " + MAX_ATTEMPTS + " polls");
+                if (entity.getAttempts() >= retryProperties.getMaxAttempts()) {
+                    deadLetter(entity, "Gave up waiting for transaction confirmation after "
+                            + retryProperties.getMaxAttempts() + " polls");
                 } else {
-                    entity.setNextAttemptAt(Instant.now().plusSeconds(backoffSeconds(entity.getAttempts())));
+                    entity.setNextAttemptAt(nextAttemptAt(entity.getAttempts()));
                 }
                 repository.save(entity);
             }
         } catch (SorobanRpcException ex) {
-            log.warn("Soroban RPC poll failed for orchestration id={}: {}", entity.getId(), ex.getMessage());
+            log.warn("Soroban RPC poll failed for orchestration id={} errorClass={}: {}",
+                    entity.getId(), ex.getClass().getSimpleName(), ex.getMessage());
             entity.setAttempts(entity.getAttempts() + 1);
             entity.setLastError(ex.getMessage());
-            if (entity.getAttempts() >= MAX_ATTEMPTS) {
-                entity.setStatus(OrchestrationStatus.DEAD_LETTER);
+            if (entity.getAttempts() >= retryProperties.getMaxAttempts()) {
+                deadLetter(entity, ex.getMessage());
             } else {
-                entity.setNextAttemptAt(Instant.now().plusSeconds(backoffSeconds(entity.getAttempts())));
+                entity.setNextAttemptAt(nextAttemptAt(entity.getAttempts()));
             }
             repository.save(entity);
         }
@@ -152,11 +189,13 @@ public class EscrowOrchestrationService {
 
     private void scheduleRetry(EscrowOrchestrationRequest entity, String error) {
         entity.setLastError(error);
-        if (entity.getAttempts() >= MAX_ATTEMPTS) {
-            entity.setStatus(OrchestrationStatus.DEAD_LETTER);
+        if (entity.getAttempts() >= retryProperties.getMaxAttempts()) {
+            deadLetter(entity, error);
         } else {
             entity.setStatus(OrchestrationStatus.PENDING);
-            entity.setNextAttemptAt(Instant.now().plusSeconds(backoffSeconds(entity.getAttempts())));
+            entity.setNextAttemptAt(nextAttemptAt(entity.getAttempts()));
+            log.info("Escrow orchestration request id={} retry scheduled attempts={} nextAttemptAt={} cause={}",
+                    entity.getId(), entity.getAttempts(), entity.getNextAttemptAt(), error);
         }
         repository.save(entity);
     }
@@ -165,9 +204,31 @@ public class EscrowOrchestrationService {
         entity.setStatus(OrchestrationStatus.FAILED);
         entity.setLastError(error);
         repository.save(entity);
+        log.warn("Escrow orchestration request id={} failed: {}", entity.getId(), error);
     }
 
-    private static long backoffSeconds(int attempts) {
-        return 1L << Math.min(attempts, 6);
+    private void deadLetter(EscrowOrchestrationRequest entity, String error) {
+        entity.setStatus(OrchestrationStatus.DEAD_LETTER);
+        entity.setLastError(error);
+        log.warn("Escrow orchestration request id={} moved to DEAD_LETTER after {} attempts: {}",
+                entity.getId(), entity.getAttempts(), error);
+    }
+
+    /**
+     * Backoff doubles from {@code baseDelay} per attempt, capped at
+     * {@code maxDelay}, then jittered by {@code +/- jitter} (a fraction of the
+     * capped delay) to avoid a thundering herd of retries hitting Soroban RPC
+     * at the same instant.
+     */
+    private Instant nextAttemptAt(int attempts) {
+        long baseMillis = Math.max(1, retryProperties.getBaseDelay().toMillis());
+        long capMillis = Math.max(baseMillis, retryProperties.getMaxDelay().toMillis());
+        int shift = Math.min(Math.max(attempts - 1, 0), 20); // guards against overflow on shift
+        long raw = baseMillis << shift;
+        long capped = (raw < 0 || raw > capMillis) ? capMillis : raw; // raw < 0 means it overflowed
+        double jitter = Math.max(0, retryProperties.getJitter());
+        double randomOffset = jitter <= 0 ? 0 : ThreadLocalRandom.current().nextDouble(-jitter, jitter);
+        long delayMillis = Math.max(1, Math.round(capped * (1.0 + randomOffset)));
+        return Instant.now().plusMillis(delayMillis);
     }
 }
