@@ -107,6 +107,41 @@ class EscrowOrchestrationServiceTest {
                 .isInstanceOf(EscrowOrchestrationNotFoundException.class);
     }
 
+    // --- requeueReconciliation() ---------------------------------------------
+
+    @Test
+    void requeueReconciliationResetsAMismatchedRequestToPending() {
+        var e = entity(1L, "k", OrchestrationStatus.CONFIRMED);
+        e.setReconciliationStatus(ReconciliationStatus.MISMATCHED);
+        e.setReconciledAt(Instant.now());
+        when(repository.findById(1L)).thenReturn(Optional.of(e));
+
+        var result = service.requeueReconciliation(1L);
+
+        assertThat(result.getReconciliationStatus()).isEqualTo(ReconciliationStatus.PENDING);
+        assertThat(result.getReconciledAt()).isNull();
+        verify(repository).save(e);
+    }
+
+    @Test
+    void requeueReconciliationRejectsANonMismatchedRequest() {
+        var e = entity(1L, "k", OrchestrationStatus.CONFIRMED);
+        e.setReconciliationStatus(ReconciliationStatus.MATCHED);
+        when(repository.findById(1L)).thenReturn(Optional.of(e));
+
+        assertThatThrownBy(() -> service.requeueReconciliation(1L))
+                .isInstanceOf(ReconciliationRequeueNotAllowedException.class);
+        verify(repository, never()).save(any());
+    }
+
+    @Test
+    void requeueReconciliationThrowsWhenNotFound() {
+        when(repository.findById(404L)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> service.requeueReconciliation(404L))
+                .isInstanceOf(EscrowOrchestrationNotFoundException.class);
+    }
+
     // --- submitOne() -----------------------------------------------------------
 
     @Test

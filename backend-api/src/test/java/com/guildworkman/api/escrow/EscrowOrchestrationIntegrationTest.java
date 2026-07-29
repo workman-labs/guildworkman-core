@@ -247,4 +247,23 @@ class EscrowOrchestrationIntegrationTest {
         EscrowOrchestrationRequest reloaded = orchestrationRequests.findById(request.getId()).orElseThrow();
         assertThat(reloaded.getReconciliationStatus()).isEqualTo(ReconciliationStatus.PENDING);
     }
+
+    @Test
+    void requeuedMismatchIsPickedUpByTheNextReconciliationSweep() {
+        var request = saveConfirmed("88", Instant.now().minusSeconds(20 * 60));
+        reconciliationService.reconcilePending();
+        assertThat(orchestrationRequests.findById(request.getId()).orElseThrow().getReconciliationStatus())
+                .isEqualTo(ReconciliationStatus.MISMATCHED);
+
+        orchestrationService.requeueReconciliation(request.getId());
+        assertThat(orchestrationRequests.findById(request.getId()).orElseThrow().getReconciliationStatus())
+                .isEqualTo(ReconciliationStatus.PENDING);
+
+        // Now the corroborating event shows up before the sweep runs again.
+        saveChainEvent("88", ChainEventStatus.PROCESSED);
+        reconciliationService.reconcilePending();
+
+        assertThat(orchestrationRequests.findById(request.getId()).orElseThrow().getReconciliationStatus())
+                .isEqualTo(ReconciliationStatus.MATCHED);
+    }
 }

@@ -163,9 +163,30 @@ affects every existing table, not something to fold into this feature PR.
 - **Log payload safety.** `SorobanRpcClient` correlates every JSON-RPC call
   with a random request id (also sent as the JSON-RPC `id`), logged and
   included in any exception message, and truncates response/error bodies to
-  500 characters before they're logged or embedded in a message — a Soroban
-  error payload can echo back request data, and this is the only place that
-  data becomes a plain log string.
+  500 characters before they're logged or embedded in a message. The
+  *outgoing* signed XDR is never itself logged or placed in an exception
+  message (only `method`/`rpcId` are) — `SorobanRpcClientTest` asserts a
+  large signed XDR never appears untruncated across the HTTP-error,
+  JSON-RPC-error, and IOException paths, including the pathological case of
+  a server response that echoes the request back. `SubmitOrchestrationRequest.signedTransactionXdr`
+  is also capped at 8192 chars and validated as base64 at the API boundary,
+  bounding both the size of what could ever reach those logs and the size of
+  an oversized/malicious request body in general.
+- **No circuit breaker / rate limiter around `SorobanRpcClient`, deliberately,
+  for now.** Same reasoning as the metrics decision above: there's no
+  Resilience4j (or similar) dependency or circuit-breaker pattern anywhere
+  else in this codebase, and introducing one is a cross-cutting infra choice
+  that deserves its own discussion. What's already in place mitigates the
+  immediate risk without it: a single unhealthy request can't retry forever
+  (bounded by `retry.max-attempts`, then `DEAD_LETTER`), can't hang a thread
+  indefinitely (bounded by `soroban.rpc.request-timeout`), and the
+  claim-one-row-per-tick shape of `submitPending`/`pollSubmitted` naturally
+  throttles how many requests hit an unhealthy endpoint concurrently — it's
+  not a token-bucket rate limit, but it's not unbounded parallel retries
+  either. A circuit breaker would mainly help by *failing fast* across
+  requests once RPC is known-down, rather than each request independently
+  discovering that; worth adding if Soroban RPC outages turn out to be
+  frequent enough to matter in practice.
 
 ## API behavior
 
@@ -204,17 +225,19 @@ affects every existing table, not something to fold into this feature PR.
   status — `reconcilePending()` only ever selects rows still `PENDING`
   (`findByStatusAndReconciliationStatus`), so once flagged it will not
   silently self-heal even after the indexer catches up and the corroborating
-  event eventually appears. Recovery today is a manual, explicit step:
-  confirm the missing on-chain event now exists (`GET /api/v1/chain/events`
-  or a direct query), then reset the row so the sweep reconsiders it:
+  event eventually appears. Recovery is an explicit step: confirm the missing
+  on-chain event now exists (`GET /api/v1/chain/events` or a direct query),
+  then call `POST /api/v1/escrow/orchestrations/{id}/requeue-reconciliation`
+  (ADMIN only) to reset it back to `PENDING` so the next sweep reconsiders
+  it — 409 if the request isn't currently `MISMATCHED`. That endpoint wraps
+  exactly this update:
   ```sql
   UPDATE escrow_orchestration_requests
   SET reconciliation_status = 'PENDING', reconciled_at = NULL
   WHERE id = :id;
   ```
-  A self-service "recheck reconciliation" admin endpoint (wrapping exactly
-  that update) is a natural, small follow-up if this becomes a frequent
-  operation.
+  which remains a valid manual fallback if direct database access is what's
+  on hand.
 
 ## Endpoints
 
@@ -222,6 +245,7 @@ affects every existing table, not something to fold into this feature PR.
 |---|---|---|---|
 | `POST` | `/api/v1/escrow/orchestrations` | Bearer | Submit a signed escrow-contract transaction for orchestration (idempotent) |
 | `GET` | `/api/v1/escrow/orchestrations/{id}` | Bearer | Fetch a request's current status |
+| `POST` | `/api/v1/escrow/orchestrations/{id}/requeue-reconciliation` | Bearer + ADMIN | Reset a `MISMATCHED` request back to `PENDING` for the next reconciliation sweep |
 
 ## Configuration
 
@@ -249,6 +273,8 @@ affects every existing table, not something to fold into this feature PR.
   just more `EscrowOperationType` values.
 - Micrometer metrics (counters/gauges) if the team wants them, once
   Actuator/Micrometer is introduced app-wide.
-- A persisted per-attempt audit trail, and/or a self-service "recheck
-  reconciliation" endpoint, if grepping logs / hand-editing rows proves
-  insufficient operationally.
+- A circuit breaker / rate limiter around `SorobanRpcClient` (e.g.
+  Resilience4j) if Soroban RPC outages prove frequent enough that failing
+  fast across requests is worth the new dependency.
+- A persisted per-attempt audit trail, if grepping logs proves insufficient
+  operationally.

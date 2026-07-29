@@ -1,6 +1,7 @@
 package com.guildworkman.api.handler;
 
 import com.guildworkman.api.escrow.service.EscrowOrchestrationNotFoundException;
+import com.guildworkman.api.escrow.service.ReconciliationRequeueNotAllowedException;
 import com.guildworkman.api.exceptions.*;
 import jakarta.validation.ConstraintViolationException;
 import org.slf4j.Logger;
@@ -94,6 +95,12 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
     public ResponseEntity<ProblemDetail> handleEscrowOrchestrationNotFound(EscrowOrchestrationNotFoundException exception) {
         return respond(HttpStatus.NOT_FOUND, "escrow-orchestration-not-found",
                 "Escrow orchestration request not found", exception.getMessage());
+    }
+
+    @ExceptionHandler(ReconciliationRequeueNotAllowedException.class)
+    public ResponseEntity<ProblemDetail> handleReconciliationRequeueNotAllowed(ReconciliationRequeueNotAllowedException exception) {
+        return respond(HttpStatus.CONFLICT, "reconciliation-requeue-not-allowed",
+                "Reconciliation requeue not allowed", exception.getMessage());
     }
 
     @ExceptionHandler(InvalidPasswordException.class)

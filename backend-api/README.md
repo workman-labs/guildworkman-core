@@ -308,6 +308,23 @@ docker compose up -d
 CI runs the same suite against a Postgres service container on every push/PR
 to `development` (`.github/workflows/test.yml`).
 
+**Background `@Scheduled` pollers default to off in tests.** `pom.xml`'s
+`maven-surefire-plugin` sets `chain.events.poll-delay-ms`,
+`escrow.orchestration.*-poll-delay-ms`, and
+`escrow.reconciliation.poll-delay-ms` to 1 hour via `systemPropertyVariables`
+for every test JVM. Without this, a `@SpringBootTest` class that doesn't
+explicitly disable scheduling leaves its poller running against the shared
+test database for the rest of the test JVM's life (Spring caches
+`ApplicationContext`s), racing with whatever test class runs next and
+processing its rows out from under it — this was an actual source of
+intermittent CI failures before the fix. Tests that specifically want a
+poller running (e.g. `ChainEventServiceIntegrationTest`,
+`EscrowOrchestrationIntegrationTest`) override the relevant property via
+their own `@SpringBootTest(properties = …)`, which takes precedence over
+the surefire-level system properties. Don't remove that
+`systemPropertyVariables` block without replacing it with an equivalent
+per-test opt-out.
+
 Existing tests cover `MailServiceTest`, `ClientServiceTest`,
 `SkilledWorkerServiceTest`, `AppointmentServiceTest`, `ReviewServiceTest`, and
 `SkillServiceTest`. All 14 tests pass as of this writing.

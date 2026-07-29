@@ -23,5 +23,11 @@ public record SubmitOrchestrationRequest(
         // literal JSON-quoted substring against ingested event topics, so a
         // stray quote could make it match (or fail to match) unrelated events.
         @NotBlank @Size(max = 128) @Pattern(regexp = "[^\"]*", message = "must not contain '\"'") String operationRef,
-        @NotBlank String signedTransactionXdr) {
+        // 8192 chars comfortably covers a realistic single-invoke-host-function
+        // envelope (typically well under 2KB base64-encoded) with headroom for
+        // multi-operation/fee-bump transactions, while still bounding request
+        // size against an oversized/malicious payload.
+        @NotBlank @Size(max = 8192)
+        @Pattern(regexp = "^[A-Za-z0-9+/]+={0,2}$", message = "must be base64-encoded")
+        String signedTransactionXdr) {
 }

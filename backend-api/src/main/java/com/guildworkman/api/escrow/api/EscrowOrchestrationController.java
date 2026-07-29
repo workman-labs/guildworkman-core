@@ -7,6 +7,7 @@ import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.web.bind.annotation.*;
 
 /**
@@ -48,5 +49,15 @@ public class EscrowOrchestrationController {
                     + "are only recorded in application logs, correlated by orchestration request id.")
     public EscrowOrchestrationResponse get(@PathVariable Long id) {
         return EscrowOrchestrationResponse.from(service.get(id));
+    }
+
+    @PostMapping("/{id}/requeue-reconciliation")
+    @PreAuthorize("hasRole('ADMIN')")
+    @Operation(summary = "Requeue a MISMATCHED request for reconciliation",
+            description = "ADMIN only. Resets reconciliationStatus back to PENDING so the next reconciliation "
+                    + "sweep reconsiders it -- e.g. after confirming the on-chain event the sweep was missing "
+                    + "has since been ingested. 409 if the request isn't currently MISMATCHED.")
+    public EscrowOrchestrationResponse requeueReconciliation(@PathVariable Long id) {
+        return EscrowOrchestrationResponse.from(service.requeueReconciliation(id));
     }
 }

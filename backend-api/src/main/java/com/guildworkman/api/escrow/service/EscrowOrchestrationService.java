@@ -3,6 +3,7 @@ package com.guildworkman.api.escrow.service;
 import com.guildworkman.api.escrow.api.SubmitOrchestrationRequest;
 import com.guildworkman.api.escrow.model.EscrowOrchestrationRequest;
 import com.guildworkman.api.escrow.model.OrchestrationStatus;
+import com.guildworkman.api.escrow.model.ReconciliationStatus;
 import com.guildworkman.api.escrow.repository.EscrowOrchestrationRequestRepository;
 import com.guildworkman.api.escrow.rpc.GetTransactionResult;
 import com.guildworkman.api.escrow.rpc.SendTransactionResult;
@@ -85,6 +86,28 @@ public class EscrowOrchestrationService {
     @Transactional(readOnly = true)
     public EscrowOrchestrationRequest get(Long id) {
         return repository.findById(id).orElseThrow(() -> new EscrowOrchestrationNotFoundException(id));
+    }
+
+    /**
+     * Resets a {@link com.guildworkman.api.escrow.model.ReconciliationStatus#MISMATCHED}
+     * request back to {@code PENDING} so {@link EscrowReconciliationService#reconcilePending()}
+     * reconsiders it on its next sweep — e.g. after confirming the missing
+     * on-chain event has now been ingested. Wraps the manual SQL documented
+     * in {@code docs/ESCROW_ORCHESTRATION.md} ("Operations") in an
+     * ADMIN-gated endpoint; see {@code EscrowOrchestrationController}.
+     */
+    @Transactional
+    public EscrowOrchestrationRequest requeueReconciliation(Long id) {
+        EscrowOrchestrationRequest entity = repository.findById(id)
+                .orElseThrow(() -> new EscrowOrchestrationNotFoundException(id));
+        if (entity.getReconciliationStatus() != ReconciliationStatus.MISMATCHED) {
+            throw new ReconciliationRequeueNotAllowedException(id, entity.getReconciliationStatus());
+        }
+        entity.setReconciliationStatus(ReconciliationStatus.PENDING);
+        entity.setReconciledAt(null);
+        repository.save(entity);
+        log.info("Escrow orchestration request id={} reconciliation requeued (was MISMATCHED)", id);
+        return entity;
     }
 
     private SubmitOutcome insertIdempotently(SubmitOrchestrationRequest request) {
@@ -170,8 +193,8 @@ public class EscrowOrchestrationService {
                             + retryProperties.getMaxAttempts() + " polls");
                 } else {
                     entity.setNextAttemptAt(nextAttemptAt(entity.getAttempts()));
+                    repository.save(entity);
                 }
-                repository.save(entity);
             }
         } catch (SorobanRpcException ex) {
             log.warn("Soroban RPC poll failed for orchestration id={} errorClass={}: {}",
@@ -182,22 +205,22 @@ public class EscrowOrchestrationService {
                 deadLetter(entity, ex.getMessage());
             } else {
                 entity.setNextAttemptAt(nextAttemptAt(entity.getAttempts()));
+                repository.save(entity);
             }
-            repository.save(entity);
         }
     }
 
     private void scheduleRetry(EscrowOrchestrationRequest entity, String error) {
-        entity.setLastError(error);
         if (entity.getAttempts() >= retryProperties.getMaxAttempts()) {
             deadLetter(entity, error);
-        } else {
-            entity.setStatus(OrchestrationStatus.PENDING);
-            entity.setNextAttemptAt(nextAttemptAt(entity.getAttempts()));
-            log.info("Escrow orchestration request id={} retry scheduled attempts={} nextAttemptAt={} cause={}",
-                    entity.getId(), entity.getAttempts(), entity.getNextAttemptAt(), error);
+            return;
         }
+        entity.setLastError(error);
+        entity.setStatus(OrchestrationStatus.PENDING);
+        entity.setNextAttemptAt(nextAttemptAt(entity.getAttempts()));
         repository.save(entity);
+        log.info("Escrow orchestration request id={} retry scheduled attempts={} nextAttemptAt={} cause={}",
+                entity.getId(), entity.getAttempts(), entity.getNextAttemptAt(), error);
     }
 
     private void fail(EscrowOrchestrationRequest entity, String error) {
@@ -207,9 +230,21 @@ public class EscrowOrchestrationService {
         log.warn("Escrow orchestration request id={} failed: {}", entity.getId(), error);
     }
 
+    /**
+     * Terminal: persists the entity itself (unlike {@link #fail}/{@link #scheduleRetry}'s
+     * non-terminal branches, this has no caller that does anything further with
+     * {@code entity} afterward, so saving here — rather than requiring every
+     * call site to remember to — removes a class of "forgot to persist"
+     * bugs). {@code nextAttemptAt} is left at its last computed value rather
+     * than cleared: it's inert once {@code DEAD_LETTER}, since
+     * {@link EscrowOrchestrationRequestRepository#claimNext} only ever
+     * selects {@code PENDING}/{@code SUBMITTED} rows, and keeping it records
+     * "when the next attempt would have been" for diagnostics.
+     */
     private void deadLetter(EscrowOrchestrationRequest entity, String error) {
         entity.setStatus(OrchestrationStatus.DEAD_LETTER);
         entity.setLastError(error);
+        repository.save(entity);
         log.warn("Escrow orchestration request id={} moved to DEAD_LETTER after {} attempts: {}",
                 entity.getId(), entity.getAttempts(), error);
     }

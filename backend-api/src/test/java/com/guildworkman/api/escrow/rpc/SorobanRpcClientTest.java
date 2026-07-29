@@ -82,4 +82,42 @@ class SorobanRpcClientTest {
                 .isInstanceOf(SorobanRpcException.class)
                 .hasMessageContaining("500");
     }
+
+    // --- request-XDR log/exception safety -----------------------------------
+
+    @Test
+    void exceptionMessageNeverContainsTheFullSignedXdrOnHttpError() {
+        String largeXdr = "X".repeat(5000);
+        server.enqueue(new MockResponse().setResponseCode(500).setBody("unrelated server error, no echo"));
+
+        assertThatThrownBy(() -> client.sendTransaction(largeXdr))
+                .isInstanceOf(SorobanRpcException.class)
+                .hasMessageNotContaining(largeXdr);
+    }
+
+    @Test
+    void exceptionMessageNeverContainsTheFullSignedXdrOnJsonRpcError() {
+        String largeXdr = "Y".repeat(5000);
+        server.enqueue(new MockResponse()
+                .setBody("{\"jsonrpc\":\"2.0\",\"id\":\"1\",\"error\":{\"code\":-32602,\"message\":\"invalid params\"}}")
+                .addHeader("Content-Type", "application/json"));
+
+        assertThatThrownBy(() -> client.sendTransaction(largeXdr))
+                .isInstanceOf(SorobanRpcException.class)
+                .hasMessageNotContaining(largeXdr);
+    }
+
+    @Test
+    void aServerResponseThatEchoesTheRequestIsTruncatedInTheExceptionMessage() {
+        String largeXdr = "Z".repeat(5000);
+        // Simulates a pathological RPC error response that echoes the
+        // offending request body back — the response is what gets truncated,
+        // not omitted, since it's still useful for debugging real RPC errors.
+        server.enqueue(new MockResponse().setResponseCode(400).setBody("bad request, you sent: " + largeXdr));
+
+        assertThatThrownBy(() -> client.sendTransaction(largeXdr))
+                .isInstanceOf(SorobanRpcException.class)
+                .hasMessageNotContaining(largeXdr)
+                .satisfies(ex -> assertThat(ex.getMessage().length()).isLessThan(largeXdr.length()));
+    }
 }
