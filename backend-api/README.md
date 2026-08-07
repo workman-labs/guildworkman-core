@@ -94,6 +94,7 @@ Core JPA entities in `data/models/`:
 | `Skill` | N:1 `SkilledWorker` | A trade/category a worker offers |
 | `Address` | — | Shared geo/address data for clients and workers (backs the `/nearby` lookup) |
 | `Appointment` | N:1 `Client`, N:1 `SkilledWorker` | A booked job |
+| `SlotReservation` | worker/client by id (`booking/model/`) | A claim on one slot of a worker's calendar — held, then confirmed into an `Appointment`. The row double-booking prevention is built on |
 | `Consultation` | N:1 `Client`, N:1 `SkilledWorker`, 1:1 `ConsultationAvailability` | A pre-booking consultation between client and worker |
 | `ConsultationAvailability` | 1:1 `Consultation` | Scheduled availability windows for a consultation |
 | `Review` | N:1 (worker/appointment) | A client's rating/feedback on a completed job |
@@ -105,6 +106,9 @@ Core JPA entities in `data/models/`:
 
 - Client and skilled-worker registration and login (JWT-based auth)
 - Appointment booking, update, cancellation, and deletion
+- Concurrency-safe slot reservation — database-level locking prevents two clients
+  double-booking a worker, plus a per-worker availability read
+  ([`docs/APPOINTMENT_BOOKING.md`](docs/APPOINTMENT_BOOKING.md))
 - Consultations: booking a consultation and scheduling client/worker availability
 - Skilled-worker profile management, skill listing, and geo lookup (`/nearby`)
 - Payment initiation/verification via **Paystack** (service layer + `PaymentServiceImpl`)
@@ -246,7 +250,7 @@ JWT authentication, RBAC, and rotating refresh tokens. Full design notes:
 |---|---|---|
 | POST | `/registerClient` | Register a new client |
 | POST | `/login` | Client login |
-| POST | `/bookAppointment` | Book an appointment. Body: `clientId`, `category`, `scheduleTime`, plus optional `skilledWorkerId` (which tradesperson) and `amount` (agreed price) |
+| POST | `/bookAppointment` | Book an appointment in one step. Body: `clientId`, `category`, `scheduleTime`, plus optional `skilledWorkerId` (which tradesperson) and `amount` (agreed price). When a worker is named, the slot is claimed through the same concurrency guard as `/api/v1/booking` — a second caller racing for it gets `409 slot-unavailable` |
 | PUT | `/updateAppointment?appointmentId=` | Set an appointment's status — body `{ "status": "ACCEPTED" }` (also accepts `amount`, `startTime`) |
 | PUT | `/cancelAppointment?appointmentId=` | Cancel an appointment — no body. Leaves the record in place with status `CANCELLED` |
 | DELETE | `/deleteAppointment?appointmentId=` | Delete an appointment outright — no body |
@@ -256,6 +260,26 @@ JWT authentication, RBAC, and rotating refresh tokens. Full design notes:
 | POST | `/{consultationId}/availability?clientAvailability=&workerAvailability=` | Schedule consultation availability |
 
 CORS: configured globally (see below) — no per-controller `@CrossOrigin`.
+
+### `BookingController` — `/api/v1/booking`
+
+Concurrency-safe booking: two visitors can never both take the same slot on a
+worker's calendar. Full design notes:
+[`docs/APPOINTMENT_BOOKING.md`](docs/APPOINTMENT_BOOKING.md).
+
+| Method | Path | Purpose |
+|---|---|---|
+| POST | `/reservations` | Hold a slot (201). Body: `idempotencyKey`, `skilledWorkerId`, `clientId`, `slotStart`, optional `durationMinutes`. Holds lapse after 5 minutes. Idempotent on `idempotencyKey` — see the `X-Idempotent-Replay` response header |
+| GET | `/reservations/{id}` | A reservation's current state |
+| POST | `/reservations/{id}/confirm` | Turn a hold into an appointment. Optional body: `category`, `amount` |
+| DELETE | `/reservations/{id}` | Release a hold early |
+| GET | `/workers/{workerId}/availability?from=&to=` | A worker's **taken** slots in a window — booked appointments and live holds. The read `viewAllAppointment` can't do, since that returns only the calling client's own bookings |
+
+Losing a race for a slot is `409 slot-unavailable`, not a `400`: the request was
+well-formed, it just arrived second.
+
+These endpoints are unwrapped (no `ApiResponse` envelope) — they return the
+reservation or availability object directly, as the escrow endpoints do.
 
 ### `SkilledWorkerController` — `/api/v1/skilledWorker`
 

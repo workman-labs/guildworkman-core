@@ -1,5 +1,6 @@
 package com.guildworkman.api.services.implmentations;
 
+import com.guildworkman.api.booking.service.SlotReservationService;
 import com.guildworkman.api.data.models.SkilledWorker;
 import com.guildworkman.api.dto.requests.*;
 import com.guildworkman.api.data.models.Address;
@@ -35,6 +36,7 @@ public class ClientServiceImpl implements ClientService {
     private final ClientRepository clientRepository;
     private final AddressRepository addressRepository;
     private final PasswordEncoder passwordEncoder;
+    private final SlotReservationService slotReservationService;
     private AppointmentService appointmentService;
 
     @Autowired
@@ -104,6 +106,11 @@ public class ClientServiceImpl implements ClientService {
         // of the job. Set the status; don't detach it from the client.
         appointmentService.cancelAppointment(appointment.getId());
 
+        // Hand the slot back. A CANCELLED appointment no longer occupies the
+        // worker's calendar, so its reservation must stop occupying it too —
+        // otherwise the time could never be rebooked by anyone.
+        slotReservationService.releaseForAppointment(appointment.getId());
+
         CancelAppointmentResponse response = new CancelAppointmentResponse();
         response.setAppointmentId(appointment.getId());
         response.setMessage("Appointment cancelled successfully");
@@ -124,6 +131,11 @@ public class ClientServiceImpl implements ClientService {
     public DeleteAppointmentResponse deleteAppointment(Long appointmentId) {
         Appointment appointment = appointmentService.findAppointmentById(appointmentId)
                 .orElseThrow(() -> new AppointmentNotFoundException("Appointment not found"));
+
+        // Free the slot before the appointment row goes: same reasoning as
+        // cancelAppointment. The reservation outlives the appointment it pointed
+        // at, keeping the slot's history.
+        slotReservationService.releaseForAppointment(appointment.getId());
 
         // Detach the appointment from BOTH sides that own it before deleting.
         //

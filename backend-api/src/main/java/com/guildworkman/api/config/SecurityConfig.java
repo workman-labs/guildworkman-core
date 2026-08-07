@@ -58,6 +58,13 @@ public class SecurityConfig {
             "/api/v1/auth/logout",
             "/api/v1/client/**",
             "/api/v1/skilledWorker/**",
+            // Booking mirrors the access level of the flow it replaces: the
+            // one-step /api/v1/client/bookAppointment is already public, and a
+            // booking calendar has to read a worker's taken slots before anyone
+            // signs in. Tightening the booking surface means tightening the
+            // client surface with it — a deliberate auth-scope change, not
+            // something to slip in with the concurrency fix.
+            "/api/v1/booking/**",
             "/api/v1/chain/events/**",
             "/v3/api-docs/**",
             "/swagger-ui/**",

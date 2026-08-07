@@ -132,6 +132,7 @@ Core JPA entities in `data/models/`:
 | `Skill` | A trade/category a worker offers |
 | `Address` | Shared geo/address data — backs the `/nearby` lookup |
 | `Appointment` | A booked job (N:1 `Client`, N:1 `SkilledWorker`) |
+| `SlotReservation` | A claim on one slot of a worker's calendar — the row that makes double-booking impossible (`booking/model/`) |
 | `Consultation` / `ConsultationAvailability` | A pre-booking consultation and its scheduled windows |
 | `Review` | A client's rating/feedback on a completed job |
 | `Transaction` / `TransactionHistory` | Paystack payment records |
@@ -145,6 +146,7 @@ envelope: **`ApiResponse { data, status }`**.
 | Controller | Base path | Highlights |
 |---|---|---|
 | `ClientController` | `/api/v1/client` | `registerClient`, `login`, `bookAppointment`, `updateAppointment`, `cancelAppointment`, `deleteAppointment`, `viewAllAppointment`, `updateClientProfile`, consultations |
+| `BookingController` | `/api/v1/booking` | Concurrency-safe booking: `reservations` (hold a slot), `confirm`, release, and `workers/{id}/availability` (a worker's taken slots) |
 | `SkilledWorkerController` | `/api/v1/skilledWorker` | `registerSkilledWorker`, `login`, `addSkill`, `findById`, `findByFullName`, `updateSkilledWorkerProfile`, `nearby` |
 | `MailController` | `/api/v1/mail` | `sendMail` (transactional email) |
 

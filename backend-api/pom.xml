@@ -190,6 +190,7 @@
 						<escrow.orchestration.submit-poll-delay-ms>3600000</escrow.orchestration.submit-poll-delay-ms>
 						<escrow.orchestration.confirm-poll-delay-ms>3600000</escrow.orchestration.confirm-poll-delay-ms>
 						<escrow.reconciliation.poll-delay-ms>3600000</escrow.reconciliation.poll-delay-ms>
+						<booking.expiry-sweep-delay-ms>3600000</booking.expiry-sweep-delay-ms>
 					</systemPropertyVariables>
 				</configuration>
 			</plugin>

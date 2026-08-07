@@ -1,5 +1,8 @@
 package com.guildworkman.api.handler;
 
+import com.guildworkman.api.booking.service.ReservationNotFoundException;
+import com.guildworkman.api.booking.service.ReservationNotHeldException;
+import com.guildworkman.api.booking.service.SlotUnavailableException;
 import com.guildworkman.api.escrow.service.EscrowOrchestrationNotFoundException;
 import com.guildworkman.api.escrow.service.ReconciliationRequeueNotAllowedException;
 import com.guildworkman.api.exceptions.*;
@@ -89,6 +92,25 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
     public ResponseEntity<ProblemDetail> handleAppointmentNotFound(AppointmentNotFoundException exception) {
         return respond(HttpStatus.NOT_FOUND, "appointment-not-found",
                 "Appointment not found", exception.getMessage());
+    }
+
+    @ExceptionHandler(ReservationNotFoundException.class)
+    public ResponseEntity<ProblemDetail> handleReservationNotFound(ReservationNotFoundException exception) {
+        return respond(HttpStatus.NOT_FOUND, "reservation-not-found",
+                "Slot reservation not found", exception.getMessage());
+    }
+
+    /** Losing a booking race is a conflict, not a client error — the request was well-formed. */
+    @ExceptionHandler(SlotUnavailableException.class)
+    public ResponseEntity<ProblemDetail> handleSlotUnavailable(SlotUnavailableException exception) {
+        return respond(HttpStatus.CONFLICT, "slot-unavailable",
+                "Slot unavailable", exception.getMessage());
+    }
+
+    @ExceptionHandler(ReservationNotHeldException.class)
+    public ResponseEntity<ProblemDetail> handleReservationNotHeld(ReservationNotHeldException exception) {
+        return respond(HttpStatus.CONFLICT, "reservation-not-held",
+                "Slot reservation is no longer held", exception.getMessage());
     }
 
     @ExceptionHandler(EscrowOrchestrationNotFoundException.class)

@@ -14,20 +14,40 @@ import com.guildworkman.api.data.repository.AppointmentRepository;
 import com.guildworkman.api.data.repository.SkilledWorkerRepository;
 import com.guildworkman.api.exceptions.GuildWorkmanException;
 import com.guildworkman.api.exceptions.UserNotFoundException;
+import com.guildworkman.api.booking.model.SlotReservation;
+import com.guildworkman.api.booking.service.SlotReservationBooker;
+import com.guildworkman.api.booking.service.SlotReservationService;
 import com.guildworkman.api.services.ServiceUtils.AppointmentService;
 import lombok.AllArgsConstructor;
 import org.modelmapper.ModelMapper;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
+import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Optional;
+import java.util.UUID;
 
 @Service
 @AllArgsConstructor
 public class AppointmentServiceImpl implements AppointmentService {
+
+    /**
+     * Marks the idempotency keys minted for one-step bookings, which have no
+     * client-supplied key of their own. Random per call: this endpoint has no
+     * way to tell a retry from a genuine second booking, so every call is a new
+     * claim (and a duplicate one loses to the slot guard, not to the key).
+     */
+    private static final String LEGACY_BOOKING_KEY_PREFIX = "book-appointment-";
+
+    /** Same rationale as {@link #LEGACY_BOOKING_KEY_PREFIX}, for slot changes. */
+    private static final String RESCHEDULE_KEY_PREFIX = "reschedule-appointment-";
+
     private final AppointmentRepository appointmentRepository;
     private  final ModelMapper modelMapper;
     private final SkilledWorkerRepository skilledWorkerRepository;
+    private final SlotReservationBooker slotReservationBooker;
+    private final SlotReservationService slotReservationService;
 
 
 //    @Autowired
@@ -36,6 +56,7 @@ public class AppointmentServiceImpl implements AppointmentService {
 //    }
 
     @Override
+    @Transactional
     public Appointment bookAppointment(BookAppointmentRequest bookAppointmentRequest) {
         Appointment appointment = modelMapper.map(bookAppointmentRequest, Appointment.class);
         appointment.setStatus(AppointmentStatus.SCHEDULED);
@@ -44,11 +65,33 @@ public class AppointmentServiceImpl implements AppointmentService {
         // ModelMapper, which can implicitly build a transient SkilledWorker from
         // skilledWorkerId — save that and Hibernate blows up. Resolve the managed
         // entity (or clear it) before persisting.
-        appointment.setSkilledWorker(resolveSkilledWorker(bookAppointmentRequest.getSkilledWorkerId()));
+        SkilledWorker skilledWorker = resolveSkilledWorker(bookAppointmentRequest.getSkilledWorkerId());
+        appointment.setSkilledWorker(skilledWorker);
         appointment.setAmount(bookAppointmentRequest.getAmount());
+
+        // Claim the slot BEFORE the appointment exists. This one-step endpoint
+        // races just as hard as the two-step reserve/confirm flow does, so it
+        // goes through the same per-worker lock and overlap check — otherwise
+        // it would be a way around the guard, and the availability read would
+        // under-report. Claiming first also matters for correctness: an
+        // appointment saved first would show up in the claim's own overlap
+        // query and conflict with itself.
+        //
+        // Only bookings that name a worker can be guarded: without one there is
+        // no calendar to double-book, and the appointment records no worker at
+        // all (see BookAppointmentRequest#skilledWorkerId).
+        SlotReservation reservation = skilledWorker == null ? null : slotReservationBooker.claimConfirmed(
+                skilledWorker.getId(),
+                bookAppointmentRequest.getClientId(),
+                bookAppointmentRequest.getScheduleTime(),
+                null,
+                LEGACY_BOOKING_KEY_PREFIX + UUID.randomUUID());
 
         appointmentRepository.save(appointment);
 
+        if (reservation != null) {
+            slotReservationBooker.linkAppointment(reservation, appointment.getId());
+        }
         return appointment;
 
     }
@@ -62,6 +105,32 @@ public class AppointmentServiceImpl implements AppointmentService {
         return skilledWorkerRepository.findById(skilledWorkerId)
                 .orElseThrow(() -> new UserNotFoundException(
                         "Skilled worker not found: " + skilledWorkerId));
+    }
+
+    /**
+     * Claims the new slot for a rescheduled appointment, giving the old one
+     * back. Throws {@code SlotUnavailableException} (409) if the new time is
+     * already taken, which leaves the whole update rolled back — a reschedule
+     * that can't get the slot must not half-apply.
+     *
+     * <p>The appointment is excluded from its own overlap check: it still
+     * carries its old {@code scheduleTime} at this point, so a small shift
+     * (10:00 to 10:30) would otherwise conflict with itself.
+     */
+    private void moveToSlot(Appointment appointment, LocalDateTime newStart) {
+        if (appointment.getSkilledWorker() == null || appointment.getClient() == null) {
+            // Nothing to double-book without a worker, and no client to hold it.
+            return;
+        }
+        slotReservationService.releaseForAppointment(appointment.getId());
+        SlotReservation moved = slotReservationBooker.claimConfirmed(
+                appointment.getSkilledWorker().getId(),
+                appointment.getClient().getId(),
+                newStart,
+                null,
+                RESCHEDULE_KEY_PREFIX + UUID.randomUUID(),
+                appointment.getId());
+        slotReservationBooker.linkAppointment(moved, appointment.getId());
     }
 
 
@@ -80,6 +149,7 @@ public class AppointmentServiceImpl implements AppointmentService {
     }
 
     @Override
+    @Transactional
     public UpdateAppointmentResponse updateAppointment(Long Id,UpdateAppointmentRequest request) {
         Appointment appointment = appointmentRepository.findById(Id)
                 .orElseThrow(()-> new AppointmentNotFoundException("No appointment found"));
@@ -94,6 +164,20 @@ public class AppointmentServiceImpl implements AppointmentService {
         if (request.getAmount() != null) {
             appointment.setAmount(request.getAmount());
         }
+
+        if (!appointment.getStatus().occupiesSlot()) {
+            // DECLINED or CANCELLED via this endpoint frees the worker's time
+            // just as much as /cancelAppointment does, so the reservation has to
+            // go back here too — otherwise declining a job would leave the slot
+            // blocked forever.
+            slotReservationService.releaseForAppointment(appointment.getId());
+        } else if (request.getStartTime() != null
+                && !request.getStartTime().equals(appointment.getScheduleTime())) {
+            // Rescheduling is a booking of a different slot and has to survive
+            // the same guard, or this endpoint becomes the way around it.
+            moveToSlot(appointment, request.getStartTime());
+        }
+
         if (request.getStartTime() != null) {
             appointment.setScheduleTime(request.getStartTime());
         }
