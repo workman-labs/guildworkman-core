@@ -11,6 +11,10 @@ import okhttp3.Response;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
+import org.stellar.sdk.KeyPair;
+import org.stellar.sdk.xdr.LedgerEntry;
+import org.stellar.sdk.xdr.LedgerEntryType;
+import org.stellar.sdk.xdr.LedgerKey;
 
 import java.io.IOException;
 import java.time.Duration;
@@ -18,11 +22,18 @@ import java.util.UUID;
 import java.util.function.Consumer;
 
 /**
- * Thin JSON-RPC 2.0 client for the Soroban RPC methods this service needs:
- * submitting a signed transaction and polling its outcome. Transaction
- * envelopes and results are treated as opaque base64 XDR strings — this
- * client never encodes or decodes XDR itself, it only relays what the
- * caller (which builds and signs transactions client-side) hands it.
+ * Thin JSON-RPC 2.0 client for the Soroban RPC methods this backend needs:
+ * simulating, submitting and polling transactions, and reading an account's
+ * sequence number.
+ *
+ * <p>Transaction envelopes and results stay opaque base64 XDR strings as they
+ * pass through {@link #sendTransaction}, {@link #getTransaction} and
+ * {@link #simulateTransaction} — the escrow orchestration flow relays
+ * envelopes its callers signed and this client has no reason to look inside
+ * them. {@link #getAccountSequence} is the one exception, and unavoidably so:
+ * a ledger entry can only be addressed by an XDR {@code LedgerKey} and only
+ * read back out of XDR, so it encodes one and decodes the other using the
+ * Stellar SDK (see {@code docs/STELLAR_SIGNING.md}).
  *
  * <p>Every call gets its own JSON-RPC {@code id} (a random UUID), reused as
  * a correlation id in logs and exception messages so a single round-trip can
@@ -77,6 +88,81 @@ public class SorobanRpcClient {
                 textOrNull(result, "status"),
                 textOrNull(result, "resultXdr"),
                 ledger);
+    }
+
+    /**
+     * Dry-runs a transaction: returns the resource fee and footprint a Soroban
+     * invocation needs, or the reason it can't succeed. Used by the signing
+     * service before it signs anything, so a contract call that is going to
+     * fail costs nothing and never consumes a sequence number.
+     *
+     * @param transactionXdr base64 {@code TransactionEnvelope} XDR; may be unsigned — simulation ignores signatures
+     */
+    public SimulateTransactionResult simulateTransaction(String transactionXdr) {
+        JsonNode result = call("simulateTransaction", params -> params.put("transaction", transactionXdr));
+        Long minResourceFee = result.hasNonNull("minResourceFee")
+                ? Long.valueOf(result.get("minResourceFee").asText())
+                : null;
+        return new SimulateTransactionResult(
+                textOrNull(result, "error"),
+                minResourceFee,
+                textOrNull(result, "transactionData"),
+                result.hasNonNull("restorePreamble"));
+    }
+
+    /**
+     * Reads an account's current sequence number straight from the ledger, via
+     * a {@code getLedgerEntries} lookup of its {@code ACCOUNT} entry.
+     *
+     * <p>This is the ground truth a channel account is resynced against after
+     * a transaction that never landed (see {@code ChannelAccountLeaseService}):
+     * the database's idea of the next sequence is a local optimisation, the
+     * chain's is the one the network validates against.
+     *
+     * @return the account's sequence number, or {@code null} if the account doesn't exist on this network yet
+     */
+    public Long getAccountSequence(String accountId) {
+        String ledgerKey = accountLedgerKey(accountId);
+        JsonNode result = call("getLedgerEntries", params -> params.putArray("keys").add(ledgerKey));
+
+        JsonNode entries = result.get("entries");
+        if (entries == null || !entries.isArray() || entries.isEmpty()) {
+            return null;
+        }
+        JsonNode entry = entries.get(0);
+        // soroban-rpc has published this field as both `xdr` and `dataXdr`
+        // across versions; accept either rather than pinning to one release.
+        String entryXdr = entry.hasNonNull("xdr") ? entry.get("xdr").asText()
+                : entry.hasNonNull("dataXdr") ? entry.get("dataXdr").asText() : null;
+        if (entryXdr == null) {
+            throw new SorobanRpcException("Soroban RPC getLedgerEntries returned an entry without XDR for account "
+                    + accountId);
+        }
+        try {
+            LedgerEntry.LedgerEntryData data = LedgerEntry.LedgerEntryData.fromXdrBase64(entryXdr);
+            if (data.getAccount() == null) {
+                throw new SorobanRpcException("Soroban RPC getLedgerEntries returned a non-account entry for "
+                        + accountId);
+            }
+            return data.getAccount().getSeqNum().getSequenceNumber().getInt64();
+        } catch (IOException ex) {
+            throw new SorobanRpcException("Could not decode the ledger entry for account " + accountId, ex);
+        }
+    }
+
+    /** Builds the base64 {@code LedgerKey} that addresses an account's ledger entry. */
+    private static String accountLedgerKey(String accountId) {
+        try {
+            LedgerKey key = LedgerKey.builder()
+                    .discriminant(LedgerEntryType.ACCOUNT)
+                    .account(LedgerKey.LedgerKeyAccount.builder()
+                            .accountID(KeyPair.fromAccountId(accountId).getXdrAccountId())
+                            .build())
+                    .build();
+            return key.toXdrBase64();
+        } catch (IOException ex) {
+            throw new SorobanRpcException("Could not encode a ledger key for account " + accountId, ex);
+        }
     }
 
     private JsonNode call(String method, Consumer<ObjectNode> paramsBuilder) {

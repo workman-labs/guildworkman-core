@@ -45,6 +45,21 @@
 			<artifactId>spring-boot-starter-data-jpa</artifactId>
 		</dependency>
 
+		<!-- Micrometer, for the submission-pipeline counters. Actuator brings
+		     micrometer-core and the /actuator/prometheus endpoint; the registry
+		     is runtime-scoped because nothing compiles against it. Both
+		     endpoints sit behind `anyRequest().authenticated()` — see
+		     docs/STELLAR_SIGNING.md ("Metrics"). -->
+		<dependency>
+			<groupId>org.springframework.boot</groupId>
+			<artifactId>spring-boot-starter-actuator</artifactId>
+		</dependency>
+		<dependency>
+			<groupId>io.micrometer</groupId>
+			<artifactId>micrometer-registry-prometheus</artifactId>
+			<scope>runtime</scope>
+		</dependency>
+
 		<dependency>
 			<groupId>org.postgresql</groupId>
 			<artifactId>postgresql</artifactId>
@@ -129,6 +144,19 @@
 			<artifactId>json-patch</artifactId>
 			<version>1.13</version>
 		</dependency>
+		<!-- Stellar/Soroban XDR, key handling and transaction building. This is
+		     the actively-maintained successor to the (archived) official
+		     java-stellar-sdk, published to Maven Central by Lightsail Network
+		     and targeting Java 8+ bytecode. The signing service needs real XDR
+		     to set a sequence number, wrap a stalled transaction in a fee bump
+		     and decode a TransactionResult's error code; see
+		     docs/STELLAR_SIGNING.md ("New dependencies") for why that changes
+		     the trade-off ESCROW_ORCHESTRATION.md made. -->
+		<dependency>
+			<groupId>network.lightsail</groupId>
+			<artifactId>stellar-sdk</artifactId>
+			<version>3.1.0</version>
+		</dependency>
 		<dependency>
 			<groupId>junit</groupId>
 			<artifactId>junit</artifactId>
@@ -191,6 +219,10 @@
 						<escrow.orchestration.confirm-poll-delay-ms>3600000</escrow.orchestration.confirm-poll-delay-ms>
 						<escrow.reconciliation.poll-delay-ms>3600000</escrow.reconciliation.poll-delay-ms>
 						<booking.expiry-sweep-delay-ms>3600000</booking.expiry-sweep-delay-ms>
+						<stellar.signing.prepare-poll-delay-ms>3600000</stellar.signing.prepare-poll-delay-ms>
+						<stellar.signing.broadcast-poll-delay-ms>3600000</stellar.signing.broadcast-poll-delay-ms>
+						<stellar.signing.confirm-poll-delay-ms>3600000</stellar.signing.confirm-poll-delay-ms>
+						<stellar.signing.lease-sweep-delay-ms>3600000</stellar.signing.lease-sweep-delay-ms>
 					</systemPropertyVariables>
 				</configuration>
 			</plugin>
