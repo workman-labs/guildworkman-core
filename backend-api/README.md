@@ -111,6 +111,11 @@ Core JPA entities in `data/models/`:
   ([`docs/APPOINTMENT_BOOKING.md`](docs/APPOINTMENT_BOOKING.md))
 - Consultations: booking a consultation and scheduling client/worker availability
 - Skilled-worker profile management, skill listing, and geo lookup (`/nearby`)
+- Server-side Stellar/Soroban transaction signing — callers hand over operations,
+  not a signed envelope or a key. Pluggable custody (local seeds in development,
+  an external KMS/HSM in production), concurrency-safe sequence numbers from a
+  channel-account pool, and fee-bump retries under a bounded fee ceiling
+  ([`docs/STELLAR_SIGNING.md`](docs/STELLAR_SIGNING.md))
 - Payment initiation/verification via **Paystack** (service layer + `PaymentServiceImpl`)
 - Transactional email sending (mail service, provider-agnostic API key + URL config)
 - Reviews and worker ratings (`ReviewServiceImpl`)
@@ -171,6 +176,25 @@ export the values into your shell, IDE run configuration, or `docker run --env-f
 | `paystack.verify.payment.url` | `PAYSTACK_VERIFY_URL` | `https://api.paystack.co/transaction/verify` |
 | `paystack.initiate.payment` | `PAYSTACK_INITIATE_URL` | `https://api.paystack.co/transaction/initialize` |
 | `spring.h2.console.enabled` | `H2_CONSOLE_ENABLED` | `false` |
+| `stellar.signing.enabled` | `STELLAR_SIGNING_ENABLED` | `true` (set `false` to pause the submission workers) |
+| `stellar.signing.provider` | `STELLAR_SIGNING_PROVIDER` | `local` (use `kms` in production) |
+| `stellar.signing.network-passphrase` | `STELLAR_NETWORK_PASSPHRASE` | `Test SDF Network ; September 2015` |
+| `stellar.signing.local.keys.<ref>` | `STELLAR_LOCAL_KEYS_<REF>` | *(empty — development seeds; never commit)* |
+| `stellar.signing.kms.url` | `STELLAR_KMS_URL` | *(empty — required when `provider=kms`)* |
+| `stellar.signing.kms.api-key` | `STELLAR_KMS_API_KEY` | *(empty — required when `provider=kms`)* |
+
+The remaining `stellar.signing.*` knobs (fee ceiling, lease TTL, retry/backoff,
+worker poll intervals) are listed in
+[`docs/STELLAR_SIGNING.md`](docs/STELLAR_SIGNING.md#configuration), along with
+an [operator runbook](docs/STELLAR_SIGNING.md#operator-runbook) for stuck
+leases, fee-ceiling failures and KMS outages. All of them are validated at
+startup — a fee ceiling below the base fee fails the boot rather than every
+transaction.
+
+Micrometer counters for the signing pipeline are exposed at
+`/actuator/prometheus`. Only `health`, `info` and `prometheus` are enabled, and
+none of them is public, so a scraper needs a bearer token or an in-cluster
+network policy; see [Metrics](docs/STELLAR_SIGNING.md#metrics).
 
 > **Security note:** this repository's git history (both the old `secret.properties`
 > committed file and, briefly, this repo's own earlier state) contains real
@@ -280,6 +304,31 @@ well-formed, it just arrived second.
 
 These endpoints are unwrapped (no `ApiResponse` envelope) — they return the
 reservation or availability object directly, as the escrow endpoints do.
+
+### Stellar signing — `/api/v1/stellar`
+
+Server-side signing and submission of Stellar/Soroban transactions. Callers
+submit an unsigned envelope carrying only the **operations** to execute; the
+service leases a channel account, sets the source, sequence number, fee and
+time bounds, simulates (for Soroban invocations), signs through the configured
+custody backend and sees the transaction through to a terminal state,
+fee-bumping it if it stalls. Full design notes:
+[`docs/STELLAR_SIGNING.md`](docs/STELLAR_SIGNING.md).
+
+| Method | Path | Auth | Purpose |
+|---|---|---|---|
+| POST | `/transactions` | Bearer | Sign and submit (202). Body: `idempotencyKey`, `unsignedTransactionXdr`, optional `reference` and `extraSignerKeyRefs`. Idempotent — see `X-Idempotent-Replay` |
+| GET | `/transactions/{id}` | Bearer | A submission's current state |
+| GET | `/transactions?reference=` | Bearer | Find submissions by the caller's own reference |
+| POST | `/channel-accounts` | ADMIN | Register a channel account by key **reference** (201) |
+| GET | `/channel-accounts` | ADMIN | List the pool with lease state |
+| GET | `/channel-accounts/{id}` | ADMIN | One pool member |
+| POST | `/channel-accounts/{id}/disable` | ADMIN | Take an account out of the pool (409 while leased) |
+| POST | `/channel-accounts/{id}/enable` | ADMIN | Return it as `NEEDS_RESYNC` |
+| POST | `/channel-accounts/{id}/resync` | ADMIN | Re-read its sequence number from the network |
+
+No request or response here ever carries key material: accounts are identified
+by key *reference*, and no endpoint returns a signed envelope.
 
 ### `SkilledWorkerController` — `/api/v1/skilledWorker`
 
