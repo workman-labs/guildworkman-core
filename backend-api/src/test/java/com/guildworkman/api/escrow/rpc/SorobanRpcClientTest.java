@@ -1,6 +1,7 @@
 package com.guildworkman.api.escrow.rpc;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.guildworkman.api.signing.StellarTestFixtures;
 import okhttp3.OkHttpClient;
 import okhttp3.mockwebserver.MockResponse;
 import okhttp3.mockwebserver.MockWebServer;
@@ -8,6 +9,7 @@ import okhttp3.mockwebserver.RecordedRequest;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.stellar.sdk.KeyPair;
 
 import java.io.IOException;
 
@@ -81,6 +83,104 @@ class SorobanRpcClientTest {
         assertThatThrownBy(() -> client.getTransaction("hash123"))
                 .isInstanceOf(SorobanRpcException.class)
                 .hasMessageContaining("500");
+    }
+
+    // --- simulateTransaction -------------------------------------------------
+
+    @Test
+    void simulateTransactionParsesASuccessfulSimulation() throws InterruptedException {
+        server.enqueue(new MockResponse()
+                .setBody("{\"jsonrpc\":\"2.0\",\"id\":\"1\",\"result\":{\"minResourceFee\":\"12345\","
+                        + "\"transactionData\":\"AAAAsoroban==\"}}")
+                .addHeader("Content-Type", "application/json"));
+
+        SimulateTransactionResult result = client.simulateTransaction("AAAA==");
+
+        assertThat(result.isSuccess()).isTrue();
+        assertThat(result.minResourceFee()).isEqualTo(12345L);
+        assertThat(result.transactionData()).isEqualTo("AAAAsoroban==");
+        assertThat(result.requiresRestore()).isFalse();
+
+        RecordedRequest recorded = server.takeRequest();
+        assertThat(recorded.getBody().readUtf8()).contains("\"method\":\"simulateTransaction\"");
+    }
+
+    /** A simulation error is a normal result, not an RPC failure — the caller decides what it means. */
+    @Test
+    void simulateTransactionReportsAnErrorWithoutThrowing() {
+        server.enqueue(new MockResponse()
+                .setBody("{\"jsonrpc\":\"2.0\",\"id\":\"1\",\"result\":{\"error\":\"HostError: contract panicked\"}}")
+                .addHeader("Content-Type", "application/json"));
+
+        SimulateTransactionResult result = client.simulateTransaction("AAAA==");
+
+        assertThat(result.isSuccess()).isFalse();
+        assertThat(result.error()).contains("contract panicked");
+    }
+
+    /** Archived state needs restoring first; the invocation as submitted cannot run. */
+    @Test
+    void simulateTransactionFlagsARestorePreamble() {
+        server.enqueue(new MockResponse()
+                .setBody("{\"jsonrpc\":\"2.0\",\"id\":\"1\",\"result\":{\"transactionData\":\"AAAA\","
+                        + "\"restorePreamble\":{\"minResourceFee\":\"100\",\"transactionData\":\"BBBB\"}}}")
+                .addHeader("Content-Type", "application/json"));
+
+        SimulateTransactionResult result = client.simulateTransaction("AAAA==");
+
+        assertThat(result.requiresRestore()).isTrue();
+        assertThat(result.isSuccess()).isFalse();
+    }
+
+    // --- getAccountSequence --------------------------------------------------
+
+    @Test
+    void getAccountSequenceDecodesTheAccountLedgerEntry() throws InterruptedException {
+        String accountId = KeyPair.random().getAccountId();
+        server.enqueue(new MockResponse()
+                .setBody("{\"jsonrpc\":\"2.0\",\"id\":\"1\",\"result\":{\"entries\":[{\"xdr\":\""
+                        + StellarTestFixtures.accountLedgerEntryXdr(accountId, 987_654_321L) + "\"}]}}")
+                .addHeader("Content-Type", "application/json"));
+
+        assertThat(client.getAccountSequence(accountId)).isEqualTo(987_654_321L);
+
+        RecordedRequest recorded = server.takeRequest();
+        assertThat(recorded.getBody().readUtf8())
+                .contains("\"method\":\"getLedgerEntries\"")
+                .contains("\"keys\":[");
+    }
+
+    /** soroban-rpc has shipped this field under both names; both must work. */
+    @Test
+    void getAccountSequenceAcceptsTheDataXdrFieldName() {
+        String accountId = KeyPair.random().getAccountId();
+        server.enqueue(new MockResponse()
+                .setBody("{\"jsonrpc\":\"2.0\",\"id\":\"1\",\"result\":{\"entries\":[{\"dataXdr\":\""
+                        + StellarTestFixtures.accountLedgerEntryXdr(accountId, 42L) + "\"}]}}")
+                .addHeader("Content-Type", "application/json"));
+
+        assertThat(client.getAccountSequence(accountId)).isEqualTo(42L);
+    }
+
+    /** An unfunded account has no ledger entry — null, so the caller can say so plainly. */
+    @Test
+    void getAccountSequenceReturnsNullForAnAccountThatIsNotOnChain() {
+        server.enqueue(new MockResponse()
+                .setBody("{\"jsonrpc\":\"2.0\",\"id\":\"1\",\"result\":{\"entries\":[]}}")
+                .addHeader("Content-Type", "application/json"));
+
+        assertThat(client.getAccountSequence(KeyPair.random().getAccountId())).isNull();
+    }
+
+    @Test
+    void getAccountSequenceRejectsAnEntryWithoutXdr() {
+        server.enqueue(new MockResponse()
+                .setBody("{\"jsonrpc\":\"2.0\",\"id\":\"1\",\"result\":{\"entries\":[{\"lastModifiedLedgerSeq\":7}]}}")
+                .addHeader("Content-Type", "application/json"));
+
+        assertThatThrownBy(() -> client.getAccountSequence(KeyPair.random().getAccountId()))
+                .isInstanceOf(SorobanRpcException.class)
+                .hasMessageContaining("without XDR");
     }
 
     // --- request-XDR log/exception safety -----------------------------------

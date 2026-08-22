@@ -42,9 +42,13 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
           cache: maven
-      - name: Run tests
+      # `verify` runs the full test suite and then packages the application, so
+      # a change that tests green but can't be built still fails the workflow.
+      # Maven's dependency cache is handled by setup-java's `cache: maven`
+      # above, keyed on pom.xml.
+      - name: Build and test
         env:
           DATABASE_URL: jdbc:postgresql://localhost:5432/service
           DATABASE_USERNAME: postgres
           DATABASE_PASSWORD: password
-        run: ./mvnw -B test
+        run: ./mvnw -B verify

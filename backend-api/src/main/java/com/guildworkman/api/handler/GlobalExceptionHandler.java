@@ -6,6 +6,14 @@ import com.guildworkman.api.booking.service.SlotUnavailableException;
 import com.guildworkman.api.escrow.service.EscrowOrchestrationNotFoundException;
 import com.guildworkman.api.escrow.service.ReconciliationRequeueNotAllowedException;
 import com.guildworkman.api.exceptions.*;
+import com.guildworkman.api.signing.custody.SigningProviderException;
+import com.guildworkman.api.signing.custody.UnknownKeyReferenceException;
+import com.guildworkman.api.signing.service.ChannelAccountAlreadyRegisteredException;
+import com.guildworkman.api.signing.service.ChannelAccountBusyException;
+import com.guildworkman.api.signing.service.ChannelAccountNotFoundException;
+import com.guildworkman.api.signing.service.NoChannelAccountAvailableException;
+import com.guildworkman.api.signing.service.SubmissionNotFoundException;
+import com.guildworkman.api.signing.service.TransactionAssemblyException;
 import jakarta.validation.ConstraintViolationException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -123,6 +131,77 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
     public ResponseEntity<ProblemDetail> handleReconciliationRequeueNotAllowed(ReconciliationRequeueNotAllowedException exception) {
         return respond(HttpStatus.CONFLICT, "reconciliation-requeue-not-allowed",
                 "Reconciliation requeue not allowed", exception.getMessage());
+    }
+
+    @ExceptionHandler(SubmissionNotFoundException.class)
+    public ResponseEntity<ProblemDetail> handleSubmissionNotFound(SubmissionNotFoundException exception) {
+        return respond(HttpStatus.NOT_FOUND, "transaction-submission-not-found",
+                "Transaction submission not found", exception.getMessage());
+    }
+
+    @ExceptionHandler(ChannelAccountNotFoundException.class)
+    public ResponseEntity<ProblemDetail> handleChannelAccountNotFound(ChannelAccountNotFoundException exception) {
+        return respond(HttpStatus.NOT_FOUND, "channel-account-not-found",
+                "Channel account not found", exception.getMessage());
+    }
+
+    @ExceptionHandler(ChannelAccountAlreadyRegisteredException.class)
+    public ResponseEntity<ProblemDetail> handleChannelAccountAlreadyRegistered(
+            ChannelAccountAlreadyRegisteredException exception) {
+        return respond(HttpStatus.CONFLICT, "channel-account-already-registered",
+                "Channel account already registered", exception.getMessage());
+    }
+
+    /** Leased is a temporary state, not a bad request: the same call succeeds once the lease ends. */
+    @ExceptionHandler(ChannelAccountBusyException.class)
+    public ResponseEntity<ProblemDetail> handleChannelAccountBusy(ChannelAccountBusyException exception) {
+        return respond(HttpStatus.CONFLICT, "channel-account-busy",
+                "Channel account is in use", exception.getMessage());
+    }
+
+    /**
+     * An empty pool is a capacity problem on our side, so it's a 503 with a
+     * {@code Retry-After} rather than a 4xx blaming the caller. The same
+     * exception covers an account that isn't funded on-chain, which an operator
+     * likewise fixes without the caller changing anything.
+     */
+    @ExceptionHandler(NoChannelAccountAvailableException.class)
+    public ResponseEntity<ProblemDetail> handleNoChannelAccountAvailable(NoChannelAccountAvailableException exception) {
+        return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
+                .header(HttpHeaders.RETRY_AFTER, "5")
+                .body(ProblemDetails.of(HttpStatus.SERVICE_UNAVAILABLE, "no-channel-account-available",
+                        "No channel account available", exception.getMessage()));
+    }
+
+    /** A rejected envelope: unparseable, a fee bump, too many operations, unsupported preconditions. */
+    @ExceptionHandler(TransactionAssemblyException.class)
+    public ResponseEntity<ProblemDetail> handleTransactionAssembly(TransactionAssemblyException exception) {
+        return respond(HttpStatus.BAD_REQUEST, "transaction-assembly-failed",
+                "Transaction could not be assembled", exception.getMessage());
+    }
+
+    /**
+     * The caller named a key this deployment's custody backend doesn't hold —
+     * a bad reference, not a server fault. The message carries only the
+     * reference, which is an alias by construction.
+     */
+    @ExceptionHandler(UnknownKeyReferenceException.class)
+    public ResponseEntity<ProblemDetail> handleUnknownKeyReference(UnknownKeyReferenceException exception) {
+        return respond(HttpStatus.BAD_REQUEST, "unknown-key-reference",
+                "Unknown key reference", exception.getMessage());
+    }
+
+    /**
+     * Custody itself failed (KMS unreachable, signature rejected). Deliberately
+     * answered with a fixed detail string: {@code SigningProviderException}
+     * redacts its own message, and this adds a second guarantee that nothing
+     * from the signing path reaches a client body.
+     */
+    @ExceptionHandler(SigningProviderException.class)
+    public ResponseEntity<ProblemDetail> handleSigningProvider(SigningProviderException exception) {
+        log.error("Signing provider failure", exception);
+        return respond(HttpStatus.SERVICE_UNAVAILABLE, "signing-unavailable",
+                "Signing unavailable", "The signing service could not sign this request. Please try again later.");
     }
 
     @ExceptionHandler(InvalidPasswordException.class)
