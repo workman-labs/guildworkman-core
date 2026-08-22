@@ -25,7 +25,16 @@ import org.springframework.stereotype.Service;
  * response) are caught here and never rethrown: this runs with nothing left
  * to observe the exception, and the whole point is that a mail failure must
  * not affect the appointment operation that already succeeded. The outcome is
- * instead recorded on the notification's {@code emailStatus}.
+ * instead recorded on the notification's {@code emailStatus} and logged at
+ * {@code ERROR}.
+ *
+ * <p><b>Observability:</b> a failure is currently only surfaced as a log line
+ * plus the persisted {@code emailStatus=FAILED} row (queryable directly, or
+ * via log-based alerting on this class). There is no emitted metric/counter —
+ * this codebase has no Micrometer/Actuator on the classpath today, and adding
+ * one is a new dependency + cross-cutting change worth its own PR rather than
+ * folding it into this one. See "Observability" in
+ * {@code docs/NOTIFICATION_SERVICE.md}.
  */
 @Service
 @RequiredArgsConstructor
@@ -48,8 +57,11 @@ public class NotificationEmailDispatcher {
             mailService.sendMail(request);
             markEmailStatus(notificationId, NotificationEmailStatus.SENT);
         } catch (Exception exception) {
-            log.warn("Failed to send notification email (notificationId={}, recipient={}): {}",
-                    notificationId, recipientEmail, exception.getMessage());
+            // ERROR, not WARN: this is the one outcome ops needs to be able to
+            // alert on from logs alone — there's no metrics counter for it (see
+            // class Javadoc), so the log line is the only signal that exists.
+            log.error("Failed to send notification email (notificationId={}, recipient={}): {}",
+                    notificationId, recipientEmail, exception.getMessage(), exception);
             markEmailStatus(notificationId, NotificationEmailStatus.FAILED);
         }
     }

@@ -131,6 +131,54 @@ Documented via springdoc (`@Operation`); errors follow the same RFC 7807
 `NotificationNotFoundException` → 404 entry was added to
 `GlobalExceptionHandler`.
 
+## Pagination
+
+`GET /api/v1/notifications` defaults to a page size of 20
+(`@PageableDefault` on `NotificationController#list`) and is now hard-capped
+at 100 regardless of what a caller passes as `?size=`
+(`spring.data.web.pageable.max-page-size`, `application.properties`) — Spring
+Data's own default cap (2000) was too high to call safe for a public list
+endpoint. Sort defaults to `createdAt DESC`, matching the
+`idx_notifications_recipient_created` index below, so the common case never
+falls back to a filesort.
+
+## Indexing & retention
+
+`Notification` carries two indexes matching its two access patterns:
+`idx_notifications_recipient_created` (`recipient_email, created_at`) for the
+paginated list, and `idx_notifications_recipient_unread`
+(`recipient_email, is_read`) for the unread count and `markAllAsRead`'s
+lookup.
+
+There is no retention/archival job. This table now gets a row per recipient
+per lifecycle event, so it grows unboundedly with appointment volume — that's
+an acceptable starting point for this issue's scope, but worth flagging as
+follow-up work before volume makes it a problem: either a scheduled sweep
+that deletes/archives read notifications past some age (mirroring
+`SlotReservationService#expireLapsedHolds`'s `@Scheduled` pattern), or a
+TTL-based partitioning strategy if this grows enough to matter operationally.
+
+## Observability
+
+A failed email send is recorded two ways: the notification's own
+`emailStatus=FAILED` (queryable directly), and an `ERROR`-level log line from
+`NotificationEmailDispatcher` with the notification id, recipient, and
+exception. There is no emitted metric/counter — this codebase has no
+Micrometer/Actuator dependency today, and adding one is a cross-cutting,
+new-dependency decision that belongs in its own PR rather than folding into
+this feature. Log-based alerting on `NotificationEmailDispatcher` at `ERROR`
+is the interim path to ops visibility.
+
+## Concurrency
+
+`Notification` intentionally has no `@Version`/optimistic-locking column. The
+only post-insert mutations are `read` flipping `false → true` and
+`emailStatus` being set exactly once by the dispatcher; both are idempotent
+and monotonic, and every read/write is already scoped by `recipientEmail`
+first. Two concurrent mark-read calls on the same row converge on the same
+end state, so optimistic locking would only risk throwing on a harmless race,
+not prevent a lost update.
+
 ## Testing
 
 - `NotificationServiceImplTest` — recipient selection per lifecycle event
@@ -145,7 +193,15 @@ Documented via springdoc (`@Operation`); errors follow the same RFC 7807
   correct `NotificationType`.
 - `NotificationControllerTest` — HTTP-level ownership scoping (list,
   unread-count, mark-read, mark-all-read) against a real JWT and a real
-  database.
+  database. Cross-user access returns `404`, not `403`: recipient scoping is
+  by `recipientEmail`, not by an id the caller passes, so there's no
+  "wrong owner, right id" case to distinguish from "no such notification" —
+  see architectural decision #3.
+- `NotificationEmailFanOutIntegrationTest` — end-to-end proof (real
+  `AppointmentService`, real transaction, real `@Async` executor, mocked
+  `MailService` throwing) that a down mail provider still lets
+  `bookAppointment` commit, and that the resulting notifications land as
+  `emailStatus=FAILED` rather than blocking or rolling back the booking.
 - Existing booking tests (`SlotReservationIntegrationTest`,
   `BookingControllerTest`, `ClientServiceTest`) now mock `MailService` so
   they don't make real calls to the mail provider now that booking triggers

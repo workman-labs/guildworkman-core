@@ -34,6 +34,16 @@ import java.time.Instant;
  * columns — it does not rename or drop them. Renaming the identity column
  * would leave the old primary key behind and could fail to apply cleanly on
  * an already-deployed database. See {@code docs/NOTIFICATION_SERVICE.md}.
+ *
+ * <p>Deliberately no {@code @Version}: the only mutation after insert is
+ * {@code read} flipping {@code false → true} (plus {@code emailStatus}, set
+ * exactly once by {@code NotificationEmailDispatcher}), and every writer
+ * scopes by {@code recipientEmail} first — see
+ * {@code NotificationServiceImpl#markAsRead}/{@code #markAllAsRead}. Two
+ * concurrent mark-read calls on the same row (a double-tap, or list + mark-all
+ * racing) both want the same end state, so optimistic locking would only add
+ * a spurious {@code OptimisticLockException} on an outcome that was already
+ * correct, not prevent a lost update.
  */
 @Entity
 @Table(name = "notifications", indexes = {
