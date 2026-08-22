@@ -1,5 +1,6 @@
 package com.guildworkman.api.signing;
 
+import jakarta.annotation.PostConstruct;
 import lombok.Getter;
 import lombok.Setter;
 import org.springframework.boot.context.properties.ConfigurationProperties;
@@ -25,6 +26,20 @@ import java.util.Map;
 @Getter
 @Setter
 public class SigningProperties {
+
+    /**
+     * Master switch for the submission workers. Set to {@code false} to stop
+     * signing, broadcasting and polling without a deploy — the rollback lever
+     * described in {@code docs/STELLAR_SIGNING.md} ("Operator runbook").
+     *
+     * <p>Pausing is safe at any point because every phase transition is
+     * already durable: work queues up as {@code PENDING}/{@code SIGNED}/
+     * {@code BROADCAST} rows and resumes exactly where it stopped. The API
+     * keeps accepting submissions while paused (they simply aren't signed
+     * yet), and the lease sweeper keeps running, so an in-flight transaction's
+     * channel account stays held rather than being handed to someone else.
+     */
+    private boolean enabled = true;
 
     /** Active custody backend: {@code local} or {@code kms}. */
     private String provider = "local";
@@ -59,6 +74,65 @@ public class SigningProperties {
     private final Kms kms = new Kms();
     private final Fee fee = new Fee();
     private final Retry retry = new Retry();
+
+    /**
+     * Refuses to start on a configuration that would misbehave in production
+     * rather than in a test.
+     *
+     * <p>The fee bounds are the reason this exists. A ceiling below the base
+     * fee makes every transaction fail {@code FEE_CEILING_REACHED} before it
+     * is ever signed — a silent, total outage that looks like a Stellar
+     * problem. A bump multiplier of 1.0 or less makes fee bumps a no-op loop
+     * that burns attempts without ever outbidding anything. Both are one typo
+     * away, and neither shows up until a transaction actually needs to go out,
+     * which in a signing service is the worst possible moment to find out.
+     *
+     * @throws IllegalStateException naming the offending property and what a valid value looks like
+     */
+    @PostConstruct
+    void validate() {
+        require("local".equals(provider) || "kms".equals(provider),
+                "stellar.signing.provider must be 'local' or 'kms', got '" + provider + "'");
+        require(networkPassphrase != null && !networkPassphrase.isBlank(),
+                "stellar.signing.network-passphrase must be set; signing for the wrong network "
+                        + "produces signatures that are valid nowhere");
+
+        require(fee.baseStroops >= MIN_STROOPS_PER_OPERATION,
+                "stellar.signing.fee.base-stroops must be at least the network minimum of "
+                        + MIN_STROOPS_PER_OPERATION + " stroops per operation, got " + fee.baseStroops);
+        require(fee.maxTotalStroops >= fee.baseStroops,
+                "stellar.signing.fee.max-total-stroops (" + fee.maxTotalStroops + ") must be at least "
+                        + "stellar.signing.fee.base-stroops (" + fee.baseStroops + "); a lower ceiling refuses "
+                        + "every transaction before it is signed");
+        require(fee.bumpMultiplier > 1.0,
+                "stellar.signing.fee.bump-multiplier must be greater than 1.0, got " + fee.bumpMultiplier
+                        + "; a bump that doesn't raise the fee cannot outbid anything");
+
+        require(retry.maxAttempts >= 1,
+                "stellar.signing.retry.max-attempts must be at least 1, got " + retry.maxAttempts);
+        require(isPositive(retry.baseDelay), "stellar.signing.retry.base-delay must be positive");
+        require(isPositive(retry.maxDelay) && retry.maxDelay.compareTo(retry.baseDelay) >= 0,
+                "stellar.signing.retry.max-delay must be positive and at least the base delay");
+        require(retry.jitter >= 0 && retry.jitter < 1,
+                "stellar.signing.retry.jitter must be in [0, 1), got " + retry.jitter);
+
+        require(isPositive(transactionTimeout), "stellar.signing.transaction-timeout must be positive");
+        require(isPositive(stallAfter), "stellar.signing.stall-after must be positive");
+        require(isPositive(leaseTtl), "stellar.signing.lease-ttl must be positive");
+    }
+
+    /** The network's minimum inclusion fee per operation. Below this nothing is ever included. */
+    private static final long MIN_STROOPS_PER_OPERATION = 100;
+
+    private static boolean isPositive(Duration duration) {
+        return duration != null && !duration.isZero() && !duration.isNegative();
+    }
+
+    private static void require(boolean condition, String message) {
+        if (!condition) {
+            throw new IllegalStateException(message);
+        }
+    }
 
     /** Development/test custody: seeds supplied by configuration. */
     @Getter

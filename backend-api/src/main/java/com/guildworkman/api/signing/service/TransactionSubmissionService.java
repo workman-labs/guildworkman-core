@@ -90,6 +90,7 @@ public class TransactionSubmissionService {
     private final FailureClassifier failureClassifier;
     private final SorobanRpcClient sorobanRpcClient;
     private final SigningProperties properties;
+    private final SigningMetrics metrics;
 
     // --- API surface --------------------------------------------------------
 
@@ -112,9 +113,11 @@ public class TransactionSubmissionService {
         for (String keyRef : request.extraSignerKeyRefsOrEmpty()) {
             signer.publicKey(keyRef);
         }
-        return submissions.findByIdempotencyKey(request.idempotencyKey())
+        SubmitOutcome outcome = submissions.findByIdempotencyKey(request.idempotencyKey())
                 .map(existing -> new SubmitOutcome(existing, true))
                 .orElseGet(() -> insertIdempotently(request));
+        metrics.submissionAccepted(outcome.replayed());
+        return outcome;
     }
 
     @Transactional(readOnly = true)
@@ -148,8 +151,14 @@ public class TransactionSubmissionService {
     @Scheduled(fixedDelayString = "${stellar.signing.prepare-poll-delay-ms:1000}")
     @Transactional
     public void preparePending() {
+        if (paused()) {
+            return;
+        }
         submissions.claimNext(EnumSet.of(SubmissionStatus.PENDING), Instant.now(), PageRequest.of(0, 1))
-                .stream().findFirst().ifPresent(this::prepareOne);
+                .stream().findFirst().ifPresent(entity -> {
+                    metrics.phaseAttempt("prepare");
+                    prepareOne(entity);
+                });
     }
 
     void prepareOne(TransactionSubmission entity) {
@@ -226,6 +235,15 @@ public class TransactionSubmissionService {
             entity.setLastError(null);
             entity.setSignedAt(now);
             entity.setNextAttemptAt(now);
+            // THE DURABILITY BOUNDARY. This save is the last statement of the
+            // @Transactional `preparePending` tick, so the envelope and its
+            // hash are committed when this method returns — and `broadcastOne`
+            // runs in a *later*, separate transaction. Nothing in this class
+            // can call sendTransaction with an envelope that isn't already on
+            // disk, because the only caller of sendTransaction is in phase 2
+            // and phase 2 only ever reads rows that are already SIGNED.
+            // Pinned by TransactionSubmissionIntegrationTest
+            // #theEnvelopeIsCommittedBeforeAnythingIsEverBroadcast.
             submissions.save(entity);
 
             log.info("Transaction signed id={} sourceAccount={} sequence={} fee={} hash={} provider={}",
@@ -246,8 +264,14 @@ public class TransactionSubmissionService {
     @Scheduled(fixedDelayString = "${stellar.signing.broadcast-poll-delay-ms:1000}")
     @Transactional
     public void broadcastSigned() {
+        if (paused()) {
+            return;
+        }
         submissions.claimNext(EnumSet.of(SubmissionStatus.SIGNED), Instant.now(), PageRequest.of(0, 1))
-                .stream().findFirst().ifPresent(this::broadcastOne);
+                .stream().findFirst().ifPresent(entity -> {
+                    metrics.phaseAttempt("broadcast");
+                    broadcastOne(entity);
+                });
     }
 
     void broadcastOne(TransactionSubmission entity) {
@@ -302,17 +326,15 @@ public class TransactionSubmissionService {
                 + (codeName == null ? "" : " (" + codeName + ")");
         entity.setResultXdr(errorResultXdr);
 
-        switch (reason) {
-            case BAD_SEQUENCE, TOO_LATE ->
-                // The envelope is dead either way: its sequence number is
-                // wrong, or its window has closed. Rebuilding is the only move
-                // that can work — and for BAD_SEQUENCE, releasing the account
-                // for resync is what stops the next attempt reproducing it.
-                    rebuild(entity, reason, detail);
-            case INSUFFICIENT_FEE -> feeBump(entity, detail);
-            case MALFORMED, BAD_AUTH, INSUFFICIENT_BALANCE, ON_CHAIN_FAILED ->
-                    fail(entity, reason, detail, false);
-            default -> scheduleRetry(entity, reason, detail, null);
+        switch (failureClassifier.recoveryFor(reason)) {
+            // REBUILD: the envelope is dead either way — its sequence number is
+            // wrong, or its window has closed. Rebuilding is the only move that
+            // can work, and releasing the account for resync is what stops the
+            // next attempt reproducing a BAD_SEQUENCE.
+            case REBUILD -> rebuild(entity, reason, detail);
+            case FEE_BUMP -> feeBump(entity, detail);
+            case TERMINAL -> fail(entity, reason, detail, false);
+            case RETRY -> scheduleRetry(entity, reason, detail, null);
         }
     }
 
@@ -321,8 +343,31 @@ public class TransactionSubmissionService {
     @Scheduled(fixedDelayString = "${stellar.signing.confirm-poll-delay-ms:1000}")
     @Transactional
     public void pollBroadcast() {
+        if (paused()) {
+            return;
+        }
         submissions.claimNext(EnumSet.of(SubmissionStatus.BROADCAST), Instant.now(), PageRequest.of(0, 1))
-                .stream().findFirst().ifPresent(this::pollOne);
+                .stream().findFirst().ifPresent(entity -> {
+                    metrics.phaseAttempt("poll");
+                    pollOne(entity);
+                });
+    }
+
+    /**
+     * The operator kill switch ({@code stellar.signing.enabled=false}).
+     *
+     * <p>Checked per tick rather than by conditioning the beans on the
+     * property, so it can be flipped by a config refresh without a restart —
+     * and so flipping it back resumes from the durable row states rather than
+     * from nothing. Submissions keep being accepted while paused; they simply
+     * queue as {@code PENDING}.
+     */
+    private boolean paused() {
+        if (properties.isEnabled()) {
+            return false;
+        }
+        log.debug("Submission workers are paused (stellar.signing.enabled=false)");
+        return true;
     }
 
     void pollOne(TransactionSubmission entity) {
@@ -428,6 +473,7 @@ public class TransactionSubmissionService {
             entity.setLastError(SecretRedactor.redact(cause));
             entity.setNextAttemptAt(Instant.now());
             submissions.save(entity);
+            metrics.feeBumped();
 
             log.info("Transaction fee-bumped id={} innerHash={} newHash={} fee={} bumps={} cause={}",
                     entity.getId(), entity.getInnerTransactionHash(), entity.getTransactionHash(),
@@ -449,6 +495,7 @@ public class TransactionSubmissionService {
         entity.setConfirmedAt(Instant.now());
         entity.setLastError(null);
         submissions.save(entity);
+        metrics.terminal(SubmissionStatus.CONFIRMED, SubmissionFailureReason.NONE);
         // The transaction reached a ledger, so its sequence number is spent
         // exactly as the pool's counter assumes: the account can go straight
         // back to AVAILABLE without a resync.
@@ -471,6 +518,7 @@ public class TransactionSubmissionService {
         entity.setFailureReason(reason);
         entity.setLastError(SecretRedactor.redact(error));
         submissions.save(entity);
+        metrics.terminal(SubmissionStatus.FAILED, reason);
         releaseLease(entity.getChannelAccountId(), sequenceConsumed);
         log.warn("Transaction submission failed id={} reason={} hash={}: {}",
                 entity.getId(), reason, entity.getTransactionHash(), entity.getLastError());
@@ -527,14 +575,25 @@ public class TransactionSubmissionService {
         if (channelAccountIdToRelease != null) {
             releaseLease(channelAccountIdToRelease, false);
         }
-        log.info("Transaction submission id={} retry scheduled attempts={} nextAttemptAt={} reason={}: {}",
-                entity.getId(), entity.getAttempts(), entity.getNextAttemptAt(), reason, entity.getLastError());
+        // NO_CHANNEL_ACCOUNT is backpressure, not a fault: under load it is the
+        // pool doing its job, and at INFO it would drown the phase out. Every
+        // other retryable reason means something outside us broke, so it stays
+        // visible without turning on debug logging. The count is on
+        // `stellar.signing.terminal`/`phase.attempts` either way.
+        if (reason == SubmissionFailureReason.NO_CHANNEL_ACCOUNT) {
+            log.debug("Transaction submission id={} waiting for a free channel account attempts={} nextAttemptAt={}",
+                    entity.getId(), entity.getAttempts(), entity.getNextAttemptAt());
+        } else {
+            log.info("Transaction submission id={} retry scheduled attempts={} nextAttemptAt={} reason={}: {}",
+                    entity.getId(), entity.getAttempts(), entity.getNextAttemptAt(), reason, entity.getLastError());
+        }
     }
 
     private void deadLetter(TransactionSubmission entity, String error) {
         entity.setStatus(SubmissionStatus.DEAD_LETTER);
         entity.setLastError(SecretRedactor.redact(error));
         submissions.save(entity);
+        metrics.terminal(SubmissionStatus.DEAD_LETTER, entity.getFailureReason());
         releaseLease(entity.getChannelAccountId(), false);
         log.warn("Transaction submission id={} moved to DEAD_LETTER after {} attempts: {}",
                 entity.getId(), entity.getAttempts(), entity.getLastError());

@@ -66,6 +66,7 @@ public class ChannelAccountLeaseService {
     private final TransactionSubmissionRepository submissions;
     private final SorobanRpcClient sorobanRpcClient;
     private final SigningProperties properties;
+    private final SigningMetrics metrics;
 
     /**
      * Takes an exclusive lease on a free channel account and allocates its
@@ -107,8 +108,10 @@ public class ChannelAccountLeaseService {
         account.setLeaseExpiresAt(expiresAt);
         channelAccounts.save(account);
 
-        log.debug("Channel account leased channelAccountId={} accountId={} sequence={} submissionId={}",
-                account.getId(), account.getAccountId(), sequenceNumber, submissionId);
+        metrics.lease(SigningMetrics.LeaseEvent.ACQUIRED);
+        log.debug("Channel account leased channelAccountId={} accountId={} sequence={} submissionId={} "
+                        + "leaseExpiresAt={} previousStatus=leasable",
+                account.getId(), account.getAccountId(), sequenceNumber, submissionId, expiresAt);
         return new SequenceLease(account.getId(), account.getAccountId(), account.getKeyRef(), sequenceNumber,
                 expiresAt);
     }
@@ -133,6 +136,14 @@ public class ChannelAccountLeaseService {
                 // problem, so long as we don't overwrite a fresher lease.
                 return;
             }
+            // NEEDS_RESYNC is not a diagnostic label — it is the mechanism.
+            // `acquire` re-reads the chain for exactly this status before it
+            // hands out a number (see the `if (NEEDS_RESYNC) resyncFromChain`
+            // above), so releasing unconsumed here is what guarantees the next
+            // lease on this account starts from what the network actually
+            // believes rather than from a counter that ran ahead of it.
+            // Proven end to end by ChannelAccountLeaseIntegrationTest
+            // #anUnconsumedSequenceForcesAResyncAndRewindsTheCounter.
             account.setStatus(sequenceConsumed
                     ? ChannelAccountStatus.AVAILABLE
                     : ChannelAccountStatus.NEEDS_RESYNC);
@@ -140,8 +151,13 @@ public class ChannelAccountLeaseService {
             account.setLeasedAt(null);
             account.setLeaseExpiresAt(null);
             channelAccounts.save(account);
-            log.debug("Channel account released channelAccountId={} status={} sequenceConsumed={}",
-                    account.getId(), account.getStatus(), sequenceConsumed);
+            metrics.lease(sequenceConsumed
+                    ? SigningMetrics.LeaseEvent.RELEASED_CONSUMED
+                    : SigningMetrics.LeaseEvent.RELEASED_NEEDS_RESYNC);
+            log.debug("Channel account released channelAccountId={} accountId={} status={} sequenceConsumed={} "
+                            + "nextSequence={}",
+                    account.getId(), account.getAccountId(), account.getStatus(), sequenceConsumed,
+                    account.getNextSequence());
         });
     }
 
@@ -168,6 +184,7 @@ public class ChannelAccountLeaseService {
             if (!active.isEmpty()) {
                 account.setLeaseExpiresAt(now.plus(properties.getLeaseTtl()));
                 channelAccounts.save(account);
+                metrics.lease(SigningMetrics.LeaseEvent.EXTENDED);
                 log.debug("Channel account lease extended channelAccountId={} activeSubmissions={}",
                         account.getId(), active.size());
                 continue;
@@ -177,6 +194,7 @@ public class ChannelAccountLeaseService {
             account.setLeasedAt(null);
             account.setLeaseExpiresAt(null);
             channelAccounts.save(account);
+            metrics.lease(SigningMetrics.LeaseEvent.RECLAIMED);
             log.warn("Reclaimed an orphaned channel-account lease channelAccountId={} accountId={}; "
                     + "sequence will be resynced from the network before reuse",
                     account.getId(), account.getAccountId());
@@ -219,6 +237,7 @@ public class ChannelAccountLeaseService {
         }
         account.setNextSequence(onChainSequence + 1);
         account.setLastSyncedAt(Instant.now());
+        metrics.lease(SigningMetrics.LeaseEvent.RESYNCED);
         log.info("Channel account resynced channelAccountId={} accountId={} nextSequence={}",
                 account.getId(), account.getAccountId(), account.getNextSequence());
     }

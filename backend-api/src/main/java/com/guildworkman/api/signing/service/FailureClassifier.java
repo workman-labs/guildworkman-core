@@ -50,6 +50,33 @@ public class FailureClassifier {
         };
     }
 
+    /**
+     * Maps a failure to the recovery it needs.
+     *
+     * <p>Exhaustive on purpose — no {@code default} arm — so a failure reason
+     * added later is a compile error here instead of quietly inheriting
+     * "retry it". That default would be the dangerous one: the whole reason
+     * {@code txBAD_SEQ} gets its own constant is that retrying it unchanged
+     * reproduces it forever, and the reason {@code txINSUFFICIENT_FEE} gets
+     * one is that <em>not</em> retrying it abandons a transaction a fee bump
+     * would have landed.
+     *
+     * <p>Note that {@link RecoveryAction#REBUILD} for {@code BAD_SEQUENCE} is
+     * also what keeps it from double-submitting: a rebuild discards the
+     * envelope and releases the channel account unconsumed, so the next
+     * attempt re-reads the chain's sequence rather than re-sending the same
+     * transaction against a number the network has already told us is wrong.
+     */
+    public RecoveryAction recoveryFor(SubmissionFailureReason reason) {
+        return switch (reason) {
+            case BAD_SEQUENCE, TOO_LATE -> RecoveryAction.REBUILD;
+            case INSUFFICIENT_FEE -> RecoveryAction.FEE_BUMP;
+            case SIMULATION_FAILED, FEE_CEILING_REACHED, MALFORMED, BAD_AUTH, INSUFFICIENT_BALANCE, ON_CHAIN_FAILED ->
+                    RecoveryAction.TERMINAL;
+            case NONE, NO_CHANNEL_ACCOUNT, SIGNING_FAILED, RPC_ERROR, UNKNOWN -> RecoveryAction.RETRY;
+        };
+    }
+
     /** @return the raw result code name for diagnostics (e.g. {@code txBAD_SEQ}), or {@code null} if undecodable. */
     public String resultCodeName(String resultXdr) {
         TransactionResultCode code = resultCode(resultXdr);

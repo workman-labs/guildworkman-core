@@ -19,17 +19,42 @@ class LocalSigningProviderTest {
         return provider;
     }
 
+    /** Exactly 32 bytes — the only length {@link SigningMessages} lets through. */
+    private static final byte[] TRANSACTION_HASH =
+            "a thirty-two byte transaction ha".getBytes(StandardCharsets.UTF_8);
+
     @Test
     void signsWithTheConfiguredKeyAndTheSignatureVerifies() {
         KeyPair keyPair = KeyPair.random();
         LocalSigningProvider provider = providerFor("channel1", String.valueOf(keyPair.getSecretSeed()));
-        byte[] message = "a 32-byte-ish transaction hash".getBytes(StandardCharsets.UTF_8);
 
-        byte[] signature = provider.sign("channel1", message);
+        byte[] signature = provider.sign("channel1", TRANSACTION_HASH);
 
         assertThat(provider.providerId()).isEqualTo("local");
         assertThat(provider.publicKey("channel1")).isEqualTo(keyPair.getAccountId());
-        assertThat(KeyPair.fromAccountId(keyPair.getAccountId()).verify(message, signature)).isTrue();
+        assertThat(KeyPair.fromAccountId(keyPair.getAccountId()).verify(TRANSACTION_HASH, signature)).isTrue();
+    }
+
+    /**
+     * An Ed25519 key that will sign whatever it is handed is a signing oracle.
+     * Constraining the input to a transaction hash doesn't prove the bytes are
+     * <em>our</em> hash, but it removes the case where a whole envelope, a
+     * concatenation, or an attacker-chosen payload reaches the key at all.
+     */
+    @Test
+    void refusesToSignAnythingThatIsNotATransactionHash() {
+        LocalSigningProvider provider = providerFor("channel1", String.valueOf(KeyPair.random().getSecretSeed()));
+
+        assertThatThrownBy(() -> provider.sign("channel1", new byte[64]))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("32-byte transaction hash")
+                .hasMessageContaining("64 bytes");
+        assertThatThrownBy(() -> provider.sign("channel1", new byte[31]))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> provider.sign("channel1", new byte[0]))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> provider.sign("channel1", null))
+                .isInstanceOf(IllegalArgumentException.class);
     }
 
     @Test
@@ -100,6 +125,50 @@ class LocalSigningProviderTest {
         assertThatThrownBy(provider::loadKeys)
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("channel1");
+    }
+
+    /**
+     * The one that matters most in practice. A seed can be kept out of API
+     * responses and out of the database and still end up in log aggregation,
+     * where it is retained, indexed and readable by everyone with a dashboard.
+     *
+     * <p>So this drives the whole lifecycle — load, resolve, sign, render —
+     * with the root logger capturing at TRACE, and asserts the seed appears
+     * nowhere in any of it. The public key is expected to appear: startup logs
+     * it on purpose, and it's public by definition.
+     */
+    @Test
+    void nothingInTheLifecycleEverLogsTheSeed() {
+        KeyPair keyPair = KeyPair.random();
+        String seed = String.valueOf(keyPair.getSecretSeed());
+
+        try (LogCapture logs = LogCapture.start()) {
+            LocalSigningProvider provider = providerFor("channel1", seed);
+            provider.publicKey("channel1");
+            provider.sign("channel1", TRANSACTION_HASH);
+            provider.supports("channel1");
+            org.slf4j.LoggerFactory.getLogger(LocalSigningProviderTest.class).info("provider={}", provider);
+
+            assertThat(logs.output())
+                    .contains(keyPair.getAccountId())
+                    .doesNotContain(seed);
+            assertThat(SecretRedactor.containsSecret(logs.output())).isFalse();
+        }
+    }
+
+    /** The same guarantee on the failure path, where an exception message is the likeliest leak. */
+    @Test
+    void aRejectedSeedIsNotLoggedEitherByUsOrByTheStrkeyParser() {
+        String almostASeed = "SBADSEEDSBADSEEDSBADSEEDSBADSEEDSBADSEEDSBADSEEDSBADSEED";
+        SigningProperties properties = new SigningProperties();
+        properties.getLocal().getKeys().put("channel1", almostASeed);
+
+        try (LogCapture logs = LogCapture.start()) {
+            LocalSigningProvider provider = new LocalSigningProvider(properties);
+            assertThatThrownBy(provider::loadKeys).isInstanceOf(IllegalStateException.class);
+
+            assertThat(logs.output()).doesNotContain(almostASeed);
+        }
     }
 
     /** Seeds live in the nested {@code Local} holder precisely so this stays true. */

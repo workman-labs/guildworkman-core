@@ -67,6 +67,19 @@ and no-ops thereafter; there is no existing column or data they could conflict
 with. The known limitation of this approach — it cannot express a safe rename
 or type change — is unchanged and app-wide, not specific to this feature.
 
+**The XDR columns are `text`, not `@Lob`.** Worth stating because the obvious
+annotation is the wrong one here. Hibernate maps `@Lob String` onto a
+PostgreSQL `oid`, a pointer into `pg_largeobject`, and large objects are *not*
+removed when the row referencing them is deleted — a service submitting
+transactions continuously would leak one per submission, unbounded and
+unreclaimable by `VACUUM`. They also can only be read inside an open
+transaction, so any read outside one fails at runtime with "Unable to access
+lob stream". `text` is unbounded in PostgreSQL and has neither problem.
+(`EscrowOrchestrationRequest.signedTransactionXdr` from #21 still uses `@Lob`
+and has the same latent leak; changing it means altering a deployed column's
+type, which `ddl-auto=update` can't do safely, so it belongs in its own PR —
+noted under [Follow-ups](#follow-ups-out-of-scope-for-this-pr).)
+
 ## Key material
 
 This is the part worth reading closely, since the failure mode is
@@ -75,8 +88,23 @@ unrecoverable: a leaked Stellar secret seed is a drained account.
 - **`SigningProvider` has no method that can return a key.** `providerId`,
   `supports`, `publicKey`, `sign` — that's the whole interface. There is no
   `secretSeed()` to accidentally call, log, or serialize.
-  `LocalSigningProviderTest` asserts the method set by reflection, so adding
-  one later fails the build.
+  `SigningProviderShapeTest` pins that method set by reflection *and* checks
+  both implementations for any public member that returns key material or is
+  merely named as though it might (`secret`, `seed`, `private`, `keypair`), for
+  any public instance field, and for a missing `toString()` override. A getter
+  added in six months fails the build with a message saying why, rather than
+  passing review as an innocuous accessor.
+- **A provider will only sign a 32-byte transaction hash.** An Ed25519 key that
+  signs whatever it is handed is a signing oracle; constraining the input
+  doesn't prove the bytes are *our* hash, but it removes the case where a whole
+  envelope, a concatenation, or an attacker-chosen payload reaches a key. The
+  KMS provider checks before it resolves the key, so an oversized payload never
+  produces a request either.
+- **The KMS gateway must be `https` and authenticated,** enforced at startup
+  rather than left to deployment convention. In cleartext the bearer credential
+  is readable and — worse — a response is *modifiable*, and a substituted
+  response is a substituted signature. Loopback is the one exemption, for tests
+  and for a sidecar-terminated proxy where there is no network path to observe.
 - **In production the key is never in this process.** With
   `stellar.signing.provider=kms`, `KmsSigningProvider` sends the 32-byte
   transaction hash to a gateway and receives a signature. Nothing else crosses
@@ -108,6 +136,21 @@ unrecoverable: a leaked Stellar secret seed is a drained account.
 - **No response body contains an envelope.** `TransactionSubmissionResponse`
   exposes public chain data (accounts, sequence, fee, hashes, ledger) and our
   own bookkeeping. The signed envelope, which carries signatures, is not in it.
+  Belt and braces on the entity behind it: `signed_envelope_xdr`,
+  `unsigned_transaction_xdr` and `result_xdr` are `@JsonIgnore`d and both
+  entities have hand-written `toString()`s rendering identifiers only — so the
+  day someone returns an entity straight from a controller, or interpolates one
+  into a log line, signatures don't ride along. (A Lombok `@ToString` would
+  have picked the envelope columns up silently; that's why these are written
+  out by hand.)
+- **Nothing here is logged, at any level.** `LocalSigningProviderTest` and
+  `KmsSigningProviderTest` drive the whole lifecycle — load, resolve, sign,
+  render, and the *failure* paths, where an exception message is the likeliest
+  leak — with a capturing appender on the **root** logger at `TRACE`, then
+  assert the seed and the API key appear nowhere in the output. Root, not the
+  class's own logger, because a leak via a library or a stack trace is still a
+  leak; `TRACE`, because production log levels are a deployment setting, not a
+  security control.
 
 ## Architecture decisions
 
@@ -200,6 +243,96 @@ unrecoverable: a leaked Stellar secret seed is a drained account.
    shape as `EscrowOrchestrationService`, which also naturally throttles how
    many requests hit an unhealthy RPC endpoint at once.
 
+## The pipeline, and where it becomes durable
+
+The one ordering rule everything else rests on: **the envelope is on disk
+before it is on the network.** Phase 1 ends by committing the signed envelope
+and its hash; phase 2 begins, in a *separate* transaction, by asking the
+network about that hash. Nothing in between.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Caller
+    participant API as TransactionSigningController
+    participant DB as PostgreSQL
+    participant P1 as preparePending()
+    participant Lease as ChannelAccountLeaseService
+    participant Sign as SigningProvider (local / KMS)
+    participant RPC as Soroban RPC
+    participant P2 as broadcastSigned()
+    participant P3 as pollBroadcast()
+
+    Caller->>API: POST /transactions (operations only)
+    API->>DB: INSERT … status=PENDING (unique idempotency_key)
+    API-->>Caller: 202 Accepted + X-Idempotent-Replay
+
+    Note over P1,DB: --- phase 1: one transaction ---
+    P1->>DB: claim a PENDING row (FOR UPDATE)
+    P1->>Lease: acquire()
+    Lease->>DB: SELECT … FOR UPDATE SKIP LOCKED
+    opt account is NEEDS_RESYNC
+        Lease->>RPC: getLedgerEntries (account sequence)
+    end
+    Lease->>DB: COMMIT lease (REQUIRES_NEW), nextSequence += 1
+    P1->>P1: rebuild onto leased account (source, sequence, fee, bounds)
+    opt Soroban invocation
+        P1->>RPC: simulateTransaction
+        RPC-->>P1: resourceFee + transactionData (or an error → terminal)
+    end
+    P1->>Sign: sign(keyRef, 32-byte hash)
+    Sign-->>P1: 64-byte signature (verified against the known public key)
+    rect rgb(230, 240, 255)
+        Note over P1,DB: THE DURABILITY BOUNDARY
+        P1->>DB: COMMIT status=SIGNED + signed_envelope_xdr + transaction_hash
+    end
+
+    Note over P2,RPC: --- phase 2: a later, separate transaction ---
+    P2->>DB: claim a SIGNED row
+    P2->>RPC: getTransaction(hash) — "did a previous life already send this?"
+    alt already on-chain
+        RPC-->>P2: SUCCESS / FAILED
+        P2->>DB: COMMIT terminal state, release lease
+    else not found
+        P2->>RPC: sendTransaction(envelope)
+        P2->>DB: COMMIT status=BROADCAST
+    end
+
+    Note over P3,RPC: --- phase 3: to a terminal state ---
+    loop until terminal
+        P3->>RPC: getTransaction(hash)
+        alt stalled past stall-after
+            P3->>Sign: sign a fee bump (≤ fee.max-total-stroops)
+            P3->>DB: COMMIT status=SIGNED, new hash — back to phase 2
+        else past validUntil
+            P3->>DB: COMMIT status=PENDING (rebuild), release lease unconsumed
+        end
+    end
+    P3->>DB: COMMIT CONFIRMED / FAILED / DEAD_LETTER
+    P3->>Lease: release(consumed?)
+    Caller->>API: GET /transactions/{id}
+```
+
+Read the boundary backwards to see what it buys. A process that dies anywhere
+in phase 2 comes back holding the exact hash it *may* have sent, and phase 2
+starts by asking about that hash — so "did we broadcast this?" is a question
+with an answer rather than a guess. Invert the ordering and the same crash
+produces a service with no record of a transaction the network has, which then
+signs a second one on a second sequence number and executes the caller's
+operations twice.
+
+A genuine resend is harmless on top of that: the same envelope has the same
+hash, so Soroban RPC answers `DUPLICATE` rather than executing it again. The
+pre-check isn't what makes resending safe — it's what makes the *accounting*
+right, recognising a transaction that landed while we were away instead of
+re-sending and re-polling it.
+
+Pinned by `TransactionSubmissionIntegrationTest`
+`#theEnvelopeIsCommittedBeforeAnythingIsEverBroadcast` (the row is committed,
+the RPC client is untouched during phase 1, and phase 2's first call is
+`getTransaction`) and
+`#aSignedRowLeftBehindByACrashedProcessIsAskedAboutBeforeItIsResent`.
+
 ## Why this always terminates
 
 Worth stating explicitly, because "retry until it lands" is exactly how a
@@ -231,12 +364,42 @@ transaction forever. Three bounds, and every path hits one of them:
   signed, the transaction hash — so one submission's whole life is greppable.
   Fee bumps log both hashes, since after a bump either may be the one that
   lands.
-- **No metrics, no circuit breaker** — same reasoning as
-  `ESCROW_ORCHESTRATION.md`: there is no Micrometer or Resilience4j anywhere in
-  this codebase, and introducing either is a cross-cutting infrastructure
-  choice that deserves its own PR rather than being smuggled into a feature.
-  What bounds the damage meanwhile: per-call HTTP timeouts, bounded attempts
-  into `DEAD_LETTER`, and one-row-per-tick claiming.
+- **Log levels follow expectedness, not severity of wording.** Terminal
+  failures are `WARN` (an operator wants to see them), rebuilds and retries are
+  `INFO`, and `NO_CHANNEL_ACCOUNT` is `DEBUG` — under load it is the pool doing
+  its job, and at `INFO` it would drown out everything else. Lease claims and
+  releases are `DEBUG` with the account, its status transition and its
+  sequence, which is the detail you want when reconstructing a `txBAD_SEQ`
+  after the fact.
+- **No circuit breaker.** Same reasoning as `ESCROW_ORCHESTRATION.md`: there is
+  no Resilience4j in this codebase and adding one is a cross-cutting choice
+  that deserves its own PR. What bounds the damage meanwhile: per-call HTTP
+  timeouts, bounded attempts into `DEAD_LETTER`, and one-row-per-tick claiming.
+
+### Metrics
+
+Micrometer counters, scraped from `/actuator/prometheus` (this PR adds
+`spring-boot-starter-actuator` and `micrometer-registry-prometheus`). They
+exist because the interesting failures here are the quiet ones: a
+dead-lettered submission and a stalled one look identical from outside — in
+both cases, nothing happens.
+
+| Meter | Tags | What a change in it means |
+|---|---|---|
+| `stellar_signing_submissions_total` | `outcome=created\|replayed` | Offered load, and how much of it is duplicate |
+| `stellar_signing_phase_attempts_total` | `phase=prepare\|broadcast\|poll` | Which phase the pipeline is spending itself on |
+| `stellar_signing_fee_bumps_total` | — | Network congestion — and an early warning that the ceiling is about to bite |
+| `stellar_signing_terminal_total` | `status`, `reason` | The alerting series. A rising `SIGNING_FAILED` is a custody outage; `NO_CHANNEL_ACCOUNT`, a pool that needs more accounts; `DEAD_LETTER`, work that needs a human |
+| `stellar_signing_leases_total` | `event=ACQUIRED\|RELEASED_CONSUMED\|RELEASED_NEEDS_RESYNC\|RECLAIMED\|EXTENDED\|RESYNCED` | `RECLAIMED` above zero means processes are dying mid-submission |
+
+Two deliberate choices. **Tag values are a closed set** — enum names and a
+fixed vocabulary of phases — so series cardinality is bounded by the code
+rather than by traffic; nothing caller-supplied (idempotency key, reference,
+account) is ever a tag, and a test asserts it. And **the actuator endpoints are
+authenticated**: only `health`, `info` and `prometheus` are exposed, none is in
+`SecurityConfig`'s `PUBLIC_ENDPOINTS`, so a scraper needs a bearer token or an
+in-cluster network policy. The tags name failure reasons and pipeline phases,
+which is more than an anonymous reader should get.
 
 ## API behavior
 
@@ -292,6 +455,128 @@ transaction forever. Three bounds, and every path hits one of them:
   local seeds. The two providers are interchangeable behind `SigningProvider`
   precisely so this is not a code change.
 
+## Operator runbook
+
+The pause lever first, since several of the procedures below use it:
+
+**`stellar.signing.enabled=false` stops the workers.** Signing, broadcasting
+and polling all halt; the API keeps accepting submissions and they queue as
+`PENDING`. This is safe at any point precisely because every phase transition
+is already durable — pausing changes no state at all, and resuming picks up
+from the rows exactly where they were. In-flight transactions keep their
+channel accounts (the sweeper extends rather than reclaims a lease whose
+submission is still live), so nothing is handed a sequence number that is
+already in the mempool. Verified by
+`TransactionSubmissionIntegrationTest#pausingStopsTheWorkersWithoutLosingOrDuplicatingWork`.
+
+### (a) A lease that won't clear
+
+**Looks like:** `503 no-channel-account-available` on submissions;
+`GET /api/v1/stellar/channel-accounts` shows members `LEASED` for longer than
+`lease-ttl`; `stellar_signing_leases_total{event="EXTENDED"}` climbing.
+
+**What's happening:** `sweepExpiredLeases` is deliberately conservative — it
+*extends* rather than reclaims any lease whose submission is still
+non-terminal, because that transaction may be in the mempool right now and
+reusing its sequence number would race it. So a lease that never clears means
+its **submission** is stuck, not the sweeper.
+
+1. Find the holder: `leased_by_submission_id` on the account row, then look up
+   that submission's `status`, `failure_reason` and `last_error`.
+2. **`BROADCAST` and the transaction is genuinely unknown to the network** —
+   it will time out at `valid_until` on its own and rebuild. Wait rather than
+   intervene; the bound is `transaction-timeout` (default 120s).
+3. **`PENDING`/`SIGNED` and not advancing** — the workers are stopped
+   (`stellar.signing.enabled=false`?) or the phase is failing. Check
+   `stellar_signing_phase_attempts_total` for movement.
+4. **Genuinely orphaned** (no submission row at all — a process died between
+   committing the lease and committing the submission): the sweeper reclaims
+   it to `NEEDS_RESYNC` within `lease-ttl`. To reclaim it sooner, lower
+   `stellar.signing.lease-ttl`; the sweep runs every
+   `stellar.signing.lease-sweep-delay-ms`.
+5. **Never** clear a lease by hand while its submission is non-terminal. The
+   next lease would reuse the sequence number and, if the original does land,
+   both transactions can't — one of them fails `txBAD_SEQ` and which one is a
+   race.
+
+**To buy headroom now:** register more channel accounts
+(`POST /api/v1/stellar/channel-accounts`). Pool size *is* the concurrency
+limit, and adding to it is online and reversible.
+
+### (b) `FEE_CEILING_REACHED`
+
+**Looks like:** submissions terminal with `failure_reason=FEE_CEILING_REACHED`;
+`stellar_signing_fee_bumps_total` rising beforehand.
+
+This is the ceiling working, not a fault: the transaction stalled, each bump
+doubled the fee, and the next one would have crossed
+`stellar.signing.fee.max-total-stroops`. The service stopped instead of
+spending more.
+
+1. **Decide whether the transaction still matters.** Its sequence number was
+   released unconsumed and the account resynced, so the pool is not stuck. The
+   operations were never executed.
+2. **If the network is congested and the work is worth more than the ceiling:**
+   raise `stellar.signing.fee.max-total-stroops` and resubmit under a **new
+   idempotency key** (the old row is terminal by design). The ceiling is a
+   per-transaction cap, so raising it raises the worst case for every
+   transaction — treat it as a spending decision.
+3. **If it fired on a Soroban invocation immediately, before any bump:** that
+   is a large *resource* fee from simulation, not congestion. The ceiling is
+   doing exactly its job — a footprint that big is usually the contract call,
+   not the network.
+4. **Do not** work around it by disabling the bump. A transaction that can't
+   outbid the mempool doesn't land; it just occupies a channel account until
+   its time bounds lapse.
+
+Startup validation refuses a ceiling below `fee.base-stroops` outright — that
+misconfiguration would fail every transaction before it was ever signed, which
+looks like a Stellar outage rather than a config typo.
+
+### (c) KMS connectivity lost
+
+**Looks like:** submissions retrying with `failure_reason=SIGNING_FAILED`,
+`503 signing-unavailable` on synchronous key-reference validation, and
+`stellar_signing_terminal_total{reason="SIGNING_FAILED"}` rising as attempts
+run out into `DEAD_LETTER`.
+
+The signing path is already fail-safe: no key material is cached, nothing is
+signed with a stale key, and a submission that can't be signed is retried and
+then dead-lettered rather than broadcast half-formed.
+
+1. **Bound the blast radius first:** `stellar.signing.enabled=false`. Work
+   queues as `PENDING` instead of burning its `retry.max-attempts` (default 5)
+   against a gateway that is down and landing in `DEAD_LETTER`, which needs a
+   human per row. This is the main reason the pause lever exists.
+2. Check gateway reachability and the credential. Signing requests carry a
+   32-byte hash and a bearer token; the provider refuses at startup to talk to
+   a non-`https` gateway (loopback excepted) or one with no API key, so a
+   *started* process was configured correctly at boot.
+3. If the gateway is up but signatures are being rejected with "unexpected
+   key" or "failed verification", **a key rotation is mid-flight.** Public keys
+   are cached for the process's lifetime on purpose — silently picking up a new
+   public key would invalidate transactions already signed against the old one.
+   Complete the rotation, then restart the service.
+4. Re-enable with `stellar.signing.enabled=true`. Queued rows resume from where
+   they stopped; nothing needs resubmitting.
+5. **Emergency fallback to local custody is a real decision, not a quick fix.**
+   `provider=local` puts seeds in this process's environment. If you take it,
+   treat those seeds as compromised afterwards and rotate the channel accounts
+   out.
+
+### Levers, in one place
+
+| Symptom | Lever | Effect |
+|---|---|---|
+| Anything, urgently | `stellar.signing.enabled=false` | Workers stop; submissions queue; nothing is lost |
+| Pool exhausted (`503`) | `POST /channel-accounts` | More concurrency, online |
+| Load shedding needed | `stellar.signing.prepare-poll-delay-ms` ↑ | Slower intake per node |
+| Orphaned leases held too long | `stellar.signing.lease-ttl` ↓ | Sweeper reclaims sooner (never reclaims a live submission) |
+| Congestion, work worth more | `stellar.signing.fee.max-total-stroops` ↑ | Higher per-transaction ceiling |
+| Bumping too early/late | `stellar.signing.stall-after` | Keep it comfortably under `transaction-timeout` |
+| Gateway flapping | `stellar.signing.retry.max-attempts` ↑ | Fewer rows reach `DEAD_LETTER` |
+| Sequence drift on one account | `POST /channel-accounts/{id}/resync` | Re-reads the chain (refused while leased) |
+
 ## Endpoints
 
 | Method | Path | Auth | Description |
@@ -313,6 +598,7 @@ annotations on the controllers.
 
 | Property | Default | Purpose |
 |---|---|---|
+| `stellar.signing.enabled` | `true` | Master switch for the workers. `false` pauses signing/broadcast/polling; submissions still queue. See [Operator runbook](#operator-runbook) |
 | `stellar.signing.provider` | `local` | Active custody backend: `local` or `kms` |
 | `stellar.signing.network-passphrase` | `Test SDF Network ; September 2015` | Network the hash is signed over; must match `soroban.rpc.url`'s network |
 | `stellar.signing.fee-source-key-ref` | *(empty)* | Key that pays for fee bumps; empty means the channel account pays for its own |
@@ -335,8 +621,20 @@ annotations on the controllers.
 | `stellar.signing.broadcast-poll-delay-ms` | `1000` | `broadcastSigned()` interval |
 | `stellar.signing.confirm-poll-delay-ms` | `1000` | `pollBroadcast()` interval |
 
+| `management.endpoints.web.exposure.include` | `health,info,prometheus` | Actuator surface. Authenticated — see [Metrics](#metrics) |
+
 Environment-variable names for all of these are in
 [`.env.example`](../.env.example).
+
+**These are validated at startup** (`SigningProperties#validate`), and a bad
+value fails the boot rather than every transaction. The fee bounds are the
+reason: a `max-total-stroops` below `base-stroops` makes every transaction fail
+`FEE_CEILING_REACHED` before it is even signed, and a `bump-multiplier` of
+`1.0` turns fee bumps into a loop that burns attempts without outbidding
+anything. Both are one typo away, and both would first surface as "Stellar is
+broken", at the exact moment a transaction needed to go out. Also checked:
+provider is `local`/`kms`, the network passphrase is set, `max-attempts ≥ 1`,
+`max-delay ≥ base-delay`, `jitter ∈ [0, 1)`, and every duration is positive.
 
 ## Tests
 
@@ -345,22 +643,45 @@ Environment-variable names for all of these are in
 - **`ChannelAccountLeaseIntegrationTest`** — the acceptance criterion, against
   real PostgreSQL: 8 threads released simultaneously by a `CyclicBarrier` get 8
   distinct accounts and 8 distinct sequence numbers; an exhausted pool refuses
-  the surplus rather than reusing an account; the consumed/unconsumed release
-  paths and the lease sweeper's conservative half are covered too. An in-memory
-  database would test nothing here — `SKIP LOCKED` is the mechanism under test.
+  the surplus rather than reusing an account. Then the recovery chain end to
+  end — a crashed holder → lease expiry → sweep to `NEEDS_RESYNC` → the next
+  lease **re-reading the chain before allocating**, asserted by moving the
+  chain's sequence between the two leases so a skipped resync fails on the
+  number rather than passing on a plausible one. Plus the negative
+  (`aConsumedReleaseCostsNoNetworkRoundTrip`: a landed transaction must *not*
+  cost a resync) and the sweeper's conservative half. An in-memory database
+  would test nothing here — `SKIP LOCKED` is the mechanism under test.
 - **`TransactionSubmissionIntegrationTest`** — the pipeline, phase by phase,
   with the RPC stubbed: the happy path (including verifying that the persisted
   envelope really carries the leased sequence and a valid signature by the
-  channel key), idempotent replay, restart safety, each failure classification,
-  stall→fee-bump, the ceiling loop terminating, expiry→rebuild, landing as the
-  pre-bump hash, and dead-lettering.
+  channel key), idempotent replay, each failure classification, stall→fee-bump,
+  the ceiling loop terminating, expiry→rebuild, landing as the pre-bump hash,
+  and dead-lettering. Restart safety gets two dedicated tests around
+  [the durability boundary](#the-pipeline-and-where-it-becomes-durable), plus
+  the pause lever and the metric counters.
 - **`KmsSigningProviderTest`** — the gateway contract over `MockWebServer`,
   including the two misconfiguration cases (wrong key, non-verifying signature)
-  that must fail here rather than at the network.
+  that must fail here rather than at the network, the transport requirements
+  (`https`, API key) refused at construction, and the oversized-payload guard.
 - **`SigningApiTest`** — status codes, the replay header, the problem+json
   contract, and the authorisation rules.
-- **`LocalSigningProviderTest`, `SecretRedactorTest`, `SigningRequestValidationTest`** —
-  the key-material guarantees listed under [Key material](#key-material).
+- **`SigningProviderShapeTest`, `LocalSigningProviderTest`, `SecretRedactorTest`,
+  `SubmissionEntityExposureTest`** — the key-material guarantees listed under
+  [Key material](#key-material): class shape, log capture, redaction, and what
+  can leave an entity.
+- **`SigningRequestValidationTest`** — request validation, including 1,000
+  freshly generated seeds against the seed guard (the pattern is a negative
+  lookahead over `[A-Z2-7]`, exactly the kind of expression that works on the
+  example it was written against and then lets one character through) and 1,000
+  randomised legitimate aliases against the mirror-image risk of a guard too
+  broad to use.
+- **`FailureClassifierTest`** — every result code, the four failure classes the
+  issue calls out one test each, and an exhaustive `RecoveryAction` table.
+  `recoveryFor` has no `default` arm, so a failure reason added later is a
+  compile error rather than a silent inheritance of "retry it" — which for a
+  transaction already on the network is the one answer that can do damage.
+- **`SigningPropertiesValidationTest`** — the startup checks described under
+  [Configuration](#configuration).
 
 ## Follow-ups (out of scope for this PR)
 
@@ -371,8 +692,16 @@ Environment-variable names for all of these are in
   surfaces as `INSUFFICIENT_BALANCE` and an operator refills it.
 - A persisted per-attempt audit trail, if grepping logs by submission id proves
   insufficient operationally.
-- Micrometer metrics — pool utilisation and fee spend are the two that would
-  earn their keep — once Actuator/Micrometer exists app-wide.
+- Gauges for pool utilisation and cumulative fee spend. This PR adds the
+  counters (see [Metrics](#metrics)); those two want a `Gauge` over live state
+  rather than a counter, which is a slightly different piece of work.
+- **Migrating `EscrowOrchestrationRequest.signedTransactionXdr` off `@Lob`.**
+  It has the same PostgreSQL large-object leak described under
+  [Schema](#schema--migrations), but its column is already deployed as `oid`
+  and `ddl-auto=update` cannot change a column's type — so it needs a
+  hand-written `ALTER TABLE … USING convert_from(lo_get(…), 'UTF8')` plus a
+  `lo_unlink` sweep of the orphaned objects. Too much to attach to this PR, and
+  it touches a table this feature doesn't own.
 - Migrating `/api/v1/escrow/orchestrations` onto this service, so escrow
   operations stop requiring client-side signing. Deliberately not folded in
   here: it changes an existing public contract and deserves its own PR.

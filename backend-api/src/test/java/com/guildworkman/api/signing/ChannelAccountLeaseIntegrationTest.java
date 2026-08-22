@@ -37,7 +37,10 @@ import java.util.concurrent.TimeUnit;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.atLeastOnce;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.reset;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
@@ -305,6 +308,96 @@ class ChannelAccountLeaseIntegrationTest {
         ChannelAccount swept = channelAccounts.findById(account.getId()).orElseThrow();
         assertThat(swept.getStatus()).isEqualTo(ChannelAccountStatus.LEASED);
         assertThat(swept.getLeaseExpiresAt()).isAfter(Instant.now());
+    }
+
+    /**
+     * The recovery chain end to end, from a crash to the next usable sequence
+     * number: a holder dies mid-submission → its lease expires → the sweeper
+     * reclaims it to {@code NEEDS_RESYNC} → the next lease <b>re-reads the
+     * chain before allocating</b> → the number handed out is the chain's, not
+     * the local counter's.
+     *
+     * <p>The last link is the one worth asserting explicitly, and it's the
+     * reason the chain's sequence is moved between the two leases here. If the
+     * resync were skipped the second lease would hand out the counter's own
+     * next value and the assertion would fail on a number that <em>looks</em>
+     * perfectly plausible — an off-by-one nobody notices until every
+     * transaction from this account starts coming back {@code txBAD_SEQ}.
+     */
+    @Test
+    void aCrashedHolderIsSweptAndTheNextLeaseReReadsTheChainBeforeAllocating() {
+        ChannelAccount account = registerPool(1).get(0);
+        long onChainAtCrashTime = onChainSequences.get(account.getAccountId());
+
+        // A submission takes the account and the process dies: nothing ever
+        // releases the lease, and we can't know whether its transaction landed.
+        SequenceLease orphaned = leases.acquire(999L);
+        assertThat(orphaned.sequenceNumber()).isEqualTo(onChainAtCrashTime + 1);
+
+        expireLease(account.getId());
+        leases.sweepExpiredLeases();
+        assertThat(channelAccounts.findById(account.getId()).orElseThrow().getStatus())
+                .isEqualTo(ChannelAccountStatus.NEEDS_RESYNC);
+
+        // While we were away the account moved on — the crashed transaction
+        // landed after all, and something else used the account too.
+        long onChainNow = onChainAtCrashTime + 5;
+        onChainSequences.put(account.getAccountId(), onChainNow);
+
+        SequenceLease afterRecovery = leases.acquire(1000L);
+
+        verify(sorobanRpcClient, atLeastOnce()).getAccountSequence(account.getAccountId());
+        assertThat(afterRecovery.sequenceNumber())
+                .withFailMessage("the lease after a resync used the local counter instead of the chain")
+                .isEqualTo(onChainNow + 1);
+        assertThat(channelAccounts.findById(account.getId()).orElseThrow().getLastSyncedAt()).isNotNull();
+    }
+
+    /**
+     * The same guarantee for the ordinary (non-crash) unconsumed release —
+     * a fee-ceiling failure, a dead-letter, an expired envelope. The chain is
+     * re-read, and the account's counter follows the network down as well as
+     * up.
+     */
+    @Test
+    void anUnconsumedReleaseMakesTheNextLeaseReReadRatherThanTrustTheCounter() {
+        ChannelAccount account = registerPool(1).get(0);
+
+        SequenceLease first = leases.acquire(1L);
+        leases.release(first.channelAccountId(), false);
+        reset(sorobanRpcClient);
+        when(sorobanRpcClient.getAccountSequence(anyString()))
+                .thenAnswer(invocation -> onChainSequences.get(invocation.getArgument(0, String.class)));
+
+        // The chain is now *behind* where the local counter was left.
+        long rewound = onChainSequences.get(account.getAccountId()) - 3;
+        onChainSequences.put(account.getAccountId(), rewound);
+
+        SequenceLease second = leases.acquire(2L);
+
+        verify(sorobanRpcClient).getAccountSequence(account.getAccountId());
+        assertThat(second.sequenceNumber()).isEqualTo(rewound + 1).isLessThan(first.sequenceNumber());
+    }
+
+    /**
+     * And the negative: a <em>consumed</em> release must not re-read. The
+     * transaction reached a ledger, so the local counter is right by
+     * construction, and an extra round trip per transaction on the hot path is
+     * a cost with nothing to buy.
+     */
+    @Test
+    void aConsumedReleaseCostsNoNetworkRoundTrip() {
+        ChannelAccount account = registerPool(1).get(0);
+
+        SequenceLease first = leases.acquire(1L);
+        leases.release(first.channelAccountId(), true);
+        reset(sorobanRpcClient);
+
+        SequenceLease second = leases.acquire(2L);
+
+        verify(sorobanRpcClient, never()).getAccountSequence(anyString());
+        assertThat(second.sequenceNumber()).isEqualTo(first.sequenceNumber() + 1);
+        assertThat(account.getId()).isEqualTo(second.channelAccountId());
     }
 
     // --- operator management -------------------------------------------------

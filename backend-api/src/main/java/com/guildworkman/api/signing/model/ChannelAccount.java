@@ -105,4 +105,19 @@ public class ChannelAccount {
     public boolean isLeasable() {
         return status == ChannelAccountStatus.AVAILABLE || status == ChannelAccountStatus.NEEDS_RESYNC;
     }
+
+    /**
+     * Every field here is public information, but this is written out by hand
+     * anyway so that the property holds by construction rather than by
+     * inspection — the same rule {@code TransactionSubmission} follows.
+     */
+    @Override
+    public String toString() {
+        return "ChannelAccount(id=" + id
+                + ", accountId=" + accountId
+                + ", keyRef=" + keyRef
+                + ", status=" + status
+                + ", nextSequence=" + nextSequence
+                + ", leasedBySubmissionId=" + leasedBySubmissionId + ")";
+    }
 }

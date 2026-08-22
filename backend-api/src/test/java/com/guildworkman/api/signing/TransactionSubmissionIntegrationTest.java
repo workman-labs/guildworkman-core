@@ -18,8 +18,10 @@ import com.guildworkman.api.signing.service.SubmissionNotFoundException;
 import com.guildworkman.api.signing.service.TransactionAssemblyException;
 import com.guildworkman.api.signing.service.TransactionSubmissionService;
 import com.guildworkman.api.signing.custody.UnknownKeyReferenceException;
+import io.micrometer.core.instrument.MeterRegistry;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.mockito.InOrder;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.mock.mockito.MockBean;
@@ -41,6 +43,7 @@ import java.util.UUID;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.reset;
 import static org.mockito.Mockito.verify;
@@ -101,6 +104,9 @@ class TransactionSubmissionIntegrationTest {
 
     @Autowired
     private SigningProperties properties;
+
+    @Autowired
+    private MeterRegistry meterRegistry;
 
     @MockBean
     private SorobanRpcClient rpc;
@@ -623,6 +629,190 @@ class TransactionSubmissionIntegrationTest {
         TransactionSubmission broadcast = reload(prepared.getId());
         assertThat(broadcast.getStatus()).isEqualTo(SubmissionStatus.BROADCAST);
         return broadcast;
+    }
+
+    // --- the durability boundary --------------------------------------------
+
+    /**
+     * The single ordering rule the whole restart story rests on: <b>the
+     * envelope is on disk before it is on the network</b>.
+     *
+     * <p>Asserted three ways, because "we save before we send" is easy to
+     * believe and easy to break. First, phase 1 leaves a committed row —
+     * re-read through a fresh {@code EntityManager}, so this is what another
+     * process would see, not what this thread has cached — carrying the
+     * envelope and the exact hash phase 2 will poll. Second, the RPC client is
+     * never touched at all during phase 1, so no send can have raced the
+     * commit. Third, phase 2's very first move against that hash is a
+     * {@code getTransaction}, not a {@code sendTransaction}.
+     *
+     * <p>Invert the ordering and this is the failure it prevents: a process
+     * that dies between broadcasting and committing comes back with no record
+     * of a transaction the network has, signs a second one on a second
+     * sequence number, and executes the caller's operations twice.
+     */
+    @Test
+    void theEnvelopeIsCommittedBeforeAnythingIsEverBroadcast() {
+        Long id = service.submit(request(StellarTestFixtures.unsignedEnvelope())).submission().getId();
+
+        service.preparePending();
+
+        // What a *different* process would read after phase 1's transaction commits.
+        submissions.flush();
+        TransactionSubmission committed = reload(id);
+        assertThat(committed.getStatus()).isEqualTo(SubmissionStatus.SIGNED);
+        assertThat(committed.getSignedEnvelopeXdr()).isNotBlank();
+        assertThat(committed.getTransactionHash()).isNotBlank().hasSize(64);
+        assertThat(committed.getSignedAt()).isNotNull();
+
+        // Phase 1 never spoke to the network beyond reading the account sequence.
+        verify(rpc, never()).sendTransaction(anyString());
+        verify(rpc, never()).getTransaction(anyString());
+
+        // The committed hash is exactly what a recovering process would ask about.
+        String hash = committed.getTransactionHash();
+        assertThat(AbstractTransaction.fromEnvelopeXdr(committed.getSignedEnvelopeXdr(), Network.TESTNET).hashHex())
+                .isEqualTo(hash);
+
+        when(rpc.getTransaction(hash)).thenReturn(notFound());
+        when(rpc.sendTransaction(anyString())).thenReturn(new SendTransactionResult(hash, "PENDING", null));
+        service.broadcastSigned();
+
+        InOrder inOrder = inOrder(rpc);
+        inOrder.verify(rpc).getTransaction(hash);
+        inOrder.verify(rpc).sendTransaction(committed.getSignedEnvelopeXdr());
+    }
+
+    /**
+     * The same rule seen from recovery's side. A row left {@code SIGNED} by a
+     * process that died is picked up by a later one and asked about before
+     * anything is sent — which is what turns "we may have broadcast this" into
+     * a question with an answer.
+     */
+    @Test
+    void aSignedRowLeftBehindByACrashedProcessIsAskedAboutBeforeItIsResent() {
+        TransactionSubmission prepared = submitAndPrepare();
+        String hash = prepared.getTransactionHash();
+
+        // The crashed process had in fact broadcast it; the network says so.
+        when(rpc.getTransaction(hash)).thenReturn(success(4242L));
+
+        service.broadcastSigned();
+
+        TransactionSubmission recovered = reload(prepared.getId());
+        assertThat(recovered.getStatus()).isEqualTo(SubmissionStatus.CONFIRMED);
+        assertThat(recovered.getLedgerSequence()).isEqualTo(4242L);
+        verify(rpc, never()).sendTransaction(anyString());
+        assertThat(statusOf(recovered.getChannelAccountId())).isEqualTo(ChannelAccountStatus.AVAILABLE);
+    }
+
+    // --- operator levers ----------------------------------------------------
+
+    /**
+     * The rollback switch. Pausing has to stop work moving without losing any,
+     * and resuming has to pick up from the durable row state rather than from
+     * the beginning — which it does for free, because pausing changes no state
+     * at all.
+     */
+    @Test
+    void pausingStopsTheWorkersWithoutLosingOrDuplicatingWork() {
+        properties.setEnabled(false);
+        try {
+            Long id = service.submit(request(StellarTestFixtures.unsignedEnvelope())).submission().getId();
+
+            service.preparePending();
+            service.broadcastSigned();
+            service.pollBroadcast();
+
+            // Submissions are still accepted — they just queue.
+            TransactionSubmission paused = reload(id);
+            assertThat(paused.getStatus()).isEqualTo(SubmissionStatus.PENDING);
+            assertThat(paused.getSignedEnvelopeXdr()).isNull();
+            assertThat(paused.getAttempts()).isZero();
+            verify(rpc, never()).sendTransaction(anyString());
+            assertThat(channelAccounts.findAll())
+                    .allMatch(account -> account.getStatus() != ChannelAccountStatus.LEASED);
+
+            properties.setEnabled(true);
+            service.preparePending();
+
+            assertThat(reload(id).getStatus()).isEqualTo(SubmissionStatus.SIGNED);
+        } finally {
+            properties.setEnabled(true);
+        }
+    }
+
+    // --- metrics ------------------------------------------------------------
+
+    /**
+     * The counters an operator would alert on. Asserted as deltas rather than
+     * absolutes: these are process-wide meters and other tests in this class
+     * share the registry.
+     */
+    @Test
+    void thePipelineCountsWhatAnOperatorWouldAlertOn() {
+        double submissionsBefore = counter("stellar.signing.submissions", "outcome", "created");
+        double replaysBefore = counter("stellar.signing.submissions", "outcome", "replayed");
+        double prepareBefore = counter("stellar.signing.phase.attempts", "phase", "prepare");
+        double leasesBefore = counter("stellar.signing.leases", "event", "ACQUIRED");
+        double confirmedBefore = counter("stellar.signing.terminal", "status", "CONFIRMED");
+
+        SubmitTransactionRequest request = request(StellarTestFixtures.unsignedEnvelope());
+        Long id = service.submit(request).submission().getId();
+        service.submit(request); // the same idempotency key: a replay
+        service.preparePending();
+        TransactionSubmission signed = reload(id);
+        when(rpc.getTransaction(signed.getTransactionHash())).thenReturn(success(99L));
+        service.broadcastSigned();
+
+        assertThat(counter("stellar.signing.submissions", "outcome", "created")).isEqualTo(submissionsBefore + 1);
+        assertThat(counter("stellar.signing.submissions", "outcome", "replayed")).isEqualTo(replaysBefore + 1);
+        assertThat(counter("stellar.signing.phase.attempts", "phase", "prepare")).isEqualTo(prepareBefore + 1);
+        assertThat(counter("stellar.signing.leases", "event", "ACQUIRED")).isEqualTo(leasesBefore + 1);
+        assertThat(counter("stellar.signing.terminal", "status", "CONFIRMED")).isEqualTo(confirmedBefore + 1);
+    }
+
+    /** A fee bump is the signal that the network is congested — or that the ceiling is about to bite. */
+    @Test
+    void feeBumpsAndDeadLettersAreCounted() {
+        double bumpsBefore = counter("stellar.signing.fee.bumps");
+        double ceilingBefore = counter("stellar.signing.terminal", "reason", "FEE_CEILING_REACHED");
+
+        TransactionSubmission broadcast = broadcastOne();
+        when(rpc.getTransaction(anyString())).thenReturn(notFound());
+        when(rpc.sendTransaction(anyString()))
+                .thenReturn(new SendTransactionResult(broadcast.getTransactionHash(), "PENDING", null));
+        backdate(broadcast, Instant.now().minusSeconds(120), Instant.now().plusSeconds(600));
+        service.pollBroadcast();
+
+        assertThat(counter("stellar.signing.fee.bumps")).isEqualTo(bumpsBefore + 1);
+        assertThat(counter("stellar.signing.terminal", "reason", "FEE_CEILING_REACHED")).isEqualTo(ceilingBefore);
+    }
+
+    /**
+     * Tag cardinality is bounded by the code, not by traffic: nothing a caller
+     * supplies may become a tag value, or a busy day turns into a metrics
+     * cardinality incident.
+     */
+    @Test
+    void noCallerSuppliedValueBecomesAMetricTag() {
+        String reference = "reference-" + UUID.randomUUID();
+        service.submit(new SubmitTransactionRequest("idem-" + UUID.randomUUID(), reference,
+                StellarTestFixtures.unsignedEnvelope(), null));
+        service.preparePending();
+
+        assertThat(meterRegistry.getMeters().stream()
+                .filter(meter -> meter.getId().getName().startsWith("stellar.signing"))
+                .flatMap(meter -> meter.getId().getTags().stream())
+                .map(io.micrometer.core.instrument.Tag::getValue))
+                .doesNotContain(reference)
+                .allSatisfy(value -> assertThat(value).doesNotContain("idem-"));
+    }
+
+    private double counter(String name, String... tags) {
+        return meterRegistry.find(name).tags(tags).counters().stream()
+                .mapToDouble(io.micrometer.core.instrument.Counter::count)
+                .sum();
     }
 
     /** Sanity: the pool this test class relies on really was registered. */

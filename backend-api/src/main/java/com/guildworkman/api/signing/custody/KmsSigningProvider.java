@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.guildworkman.api.signing.SigningProperties;
+import okhttp3.HttpUrl;
 import okhttp3.MediaType;
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
@@ -68,6 +69,7 @@ public class KmsSigningProvider implements SigningProvider {
     public KmsSigningProvider(OkHttpClient httpClient, ObjectMapper objectMapper, SigningProperties properties) {
         this.objectMapper = objectMapper;
         this.properties = properties;
+        requireSecureGateway(properties.getKms());
         Duration timeout = properties.getKms().getRequestTimeout();
         // Same treatment as SorobanRpcClient: the shared app-wide OkHttpClient
         // bean keeps its own defaults, this copy gets the KMS timeout budget so
@@ -78,10 +80,44 @@ public class KmsSigningProvider implements SigningProvider {
                 .readTimeout(timeout)
                 .writeTimeout(timeout)
                 .build();
-        if (properties.getKms().getUrl() == null || properties.getKms().getUrl().isBlank()) {
+    }
+
+    /**
+     * Refuses to start against a gateway this service can't talk to safely.
+     *
+     * <p>Signing requests carry a bearer credential and come back with
+     * signatures; in cleartext both are readable and, worse, modifiable by
+     * anything on the path — a substituted response is a substituted
+     * signature. TLS is therefore a startup requirement, not a deployment
+     * convention, and a missing API key is refused for the same reason: an
+     * unauthenticated signing gateway is one anybody who can reach it can use.
+     *
+     * <p>Loopback is the one exemption, for tests and for a sidecar-terminated
+     * mTLS proxy on the same host, where there is no network path to observe.
+     */
+    private static void requireSecureGateway(SigningProperties.Kms kms) {
+        if (kms.getUrl() == null || kms.getUrl().isBlank()) {
             throw new IllegalStateException(
                     "stellar.signing.provider=kms requires stellar.signing.kms.url to be set");
         }
+        HttpUrl url = HttpUrl.parse(kms.getUrl());
+        if (url == null) {
+            throw new IllegalStateException(
+                    "stellar.signing.kms.url is not a valid http(s) URL");
+        }
+        if (!url.isHttps() && !isLoopback(url.host())) {
+            throw new IllegalStateException("stellar.signing.kms.url must use https (got '" + url.scheme()
+                    + "' to host '" + url.host() + "'); a signing gateway reached in cleartext exposes the API key "
+                    + "and lets a network attacker substitute signatures");
+        }
+        if (kms.getApiKey() == null || kms.getApiKey().isBlank()) {
+            throw new IllegalStateException("stellar.signing.provider=kms requires stellar.signing.kms.api-key "
+                    + "to be set; an unauthenticated signing gateway will sign for anyone who can reach it");
+        }
+    }
+
+    private static boolean isLoopback(String host) {
+        return "localhost".equals(host) || "127.0.0.1".equals(host) || "::1".equals(host);
     }
 
     @Override
@@ -132,6 +168,9 @@ public class KmsSigningProvider implements SigningProvider {
 
     @Override
     public byte[] sign(String keyRef, byte[] message) {
+        // Checked before the key is even resolved: an oversized payload never
+        // reaches the gateway, so it can never reach a key.
+        SigningMessages.requireTransactionHash(keyRef, message);
         String expectedPublicKey = publicKey(keyRef);
 
         ObjectNode payload = objectMapper.createObjectNode();

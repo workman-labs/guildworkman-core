@@ -1,5 +1,6 @@
 package com.guildworkman.api.signing.model;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
 import jakarta.persistence.EnumType;
@@ -8,7 +9,6 @@ import jakarta.persistence.GeneratedValue;
 import jakarta.persistence.GenerationType;
 import jakarta.persistence.Id;
 import jakarta.persistence.Index;
-import jakarta.persistence.Lob;
 import jakarta.persistence.Table;
 import jakarta.persistence.UniqueConstraint;
 import jakarta.persistence.Version;
@@ -43,6 +43,16 @@ import java.time.Instant;
  * which after a fee bump is the <em>outer</em> fee-bump transaction;
  * {@link #innerTransactionHash} keeps the original so a transaction that
  * landed on its own, just as we bumped it, is still recognised.
+ *
+ * <p><b>What must not escape this row.</b> No key material is stored here —
+ * {@link #keyRef} is an alias and {@link #sourceAccount} a public key — but
+ * {@link #signedEnvelopeXdr} carries signatures, and it plus
+ * {@link #unsignedTransactionXdr} and {@link #resultXdr} carry the full
+ * contents of what the caller asked to execute. None of that belongs in a log
+ * line or an HTTP response, so all three are {@link JsonIgnore}d and
+ * {@link #toString()} renders identifiers only. The API answers from
+ * {@code TransactionSubmissionResponse}, which never reads them at all; these
+ * are the second lock, for the day someone returns an entity directly.
  */
 @Entity
 @Table(name = "stellar_transaction_submissions",
@@ -70,9 +80,21 @@ public class TransactionSubmission {
     @Column(length = 128)
     private String reference;
 
-    /** Base64 {@code TransactionEnvelope} XDR supplying the operations to execute. Never signed as-is. */
-    @Lob
-    @Column(name = "unsigned_transaction_xdr", nullable = false, updatable = false)
+    /**
+     * Base64 {@code TransactionEnvelope} XDR supplying the operations to execute. Never signed as-is.
+     *
+     * <p>{@code text}, deliberately, rather than {@code @Lob}. Hibernate maps
+     * {@code @Lob String} onto a PostgreSQL {@code oid} — a pointer into
+     * {@code pg_largeobject} — which brings two problems this table cannot
+     * live with. Large objects are <b>not</b> removed when the row referencing
+     * them is deleted, so a service submitting transactions continuously would
+     * leak one per submission, unbounded and unreclaimable by {@code VACUUM}.
+     * And reading one requires an open transaction, so any read outside one
+     * fails at runtime with "Unable to access lob stream". PostgreSQL
+     * {@code text} is unbounded and none of that applies.
+     */
+    @JsonIgnore
+    @Column(name = "unsigned_transaction_xdr", nullable = false, updatable = false, columnDefinition = "text")
     private String unsignedTransactionXdr;
 
     /**
@@ -116,9 +138,13 @@ public class TransactionSubmission {
     @Column(name = "fee_bump_count", nullable = false)
     private int feeBumpCount;
 
-    /** Signed envelope currently in flight — after a fee bump, the fee-bump envelope. */
-    @Lob
-    @Column(name = "signed_envelope_xdr")
+    /**
+     * Signed envelope currently in flight — after a fee bump, the fee-bump
+     * envelope. Carries signatures. {@code text} for the reasons on
+     * {@link #unsignedTransactionXdr}.
+     */
+    @JsonIgnore
+    @Column(name = "signed_envelope_xdr", columnDefinition = "text")
     private String signedEnvelopeXdr;
 
     /** Hash of {@link #signedEnvelopeXdr}: what {@code getTransaction} is polled with. */
@@ -141,7 +167,8 @@ public class TransactionSubmission {
     @Column(name = "valid_until")
     private Instant validUntil;
 
-    /** Base64 {@code TransactionResult} XDR of a terminal outcome, for post-hoc diagnosis. */
+    /** Base64 {@code TransactionResult} XDR of a terminal outcome, for post-hoc diagnosis. Echoes transaction contents. */
+    @JsonIgnore
     @Column(name = "result_xdr", length = 2000)
     private String resultXdr;
 
@@ -169,4 +196,26 @@ public class TransactionSubmission {
 
     @Version
     private long version;
+
+    /**
+     * Identifiers and state only. Written out by hand rather than generated so
+     * that a field added later has to be added here deliberately — a Lombok
+     * {@code @ToString} would have picked up the envelope columns silently,
+     * and a submission entity interpolated into a log line is exactly how
+     * signatures end up in log aggregation.
+     */
+    @Override
+    public String toString() {
+        return "TransactionSubmission(id=" + id
+                + ", idempotencyKey=" + idempotencyKey
+                + ", reference=" + reference
+                + ", status=" + status
+                + ", failureReason=" + failureReason
+                + ", sourceAccount=" + sourceAccount
+                + ", sequenceNumber=" + sequenceNumber
+                + ", feeStroops=" + feeStroops
+                + ", feeBumpCount=" + feeBumpCount
+                + ", transactionHash=" + transactionHash
+                + ", attempts=" + attempts + ")";
+    }
 }

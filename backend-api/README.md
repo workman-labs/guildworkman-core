@@ -176,6 +176,7 @@ export the values into your shell, IDE run configuration, or `docker run --env-f
 | `paystack.verify.payment.url` | `PAYSTACK_VERIFY_URL` | `https://api.paystack.co/transaction/verify` |
 | `paystack.initiate.payment` | `PAYSTACK_INITIATE_URL` | `https://api.paystack.co/transaction/initialize` |
 | `spring.h2.console.enabled` | `H2_CONSOLE_ENABLED` | `false` |
+| `stellar.signing.enabled` | `STELLAR_SIGNING_ENABLED` | `true` (set `false` to pause the submission workers) |
 | `stellar.signing.provider` | `STELLAR_SIGNING_PROVIDER` | `local` (use `kms` in production) |
 | `stellar.signing.network-passphrase` | `STELLAR_NETWORK_PASSPHRASE` | `Test SDF Network ; September 2015` |
 | `stellar.signing.local.keys.<ref>` | `STELLAR_LOCAL_KEYS_<REF>` | *(empty — development seeds; never commit)* |
@@ -184,7 +185,16 @@ export the values into your shell, IDE run configuration, or `docker run --env-f
 
 The remaining `stellar.signing.*` knobs (fee ceiling, lease TTL, retry/backoff,
 worker poll intervals) are listed in
-[`docs/STELLAR_SIGNING.md`](docs/STELLAR_SIGNING.md#configuration).
+[`docs/STELLAR_SIGNING.md`](docs/STELLAR_SIGNING.md#configuration), along with
+an [operator runbook](docs/STELLAR_SIGNING.md#operator-runbook) for stuck
+leases, fee-ceiling failures and KMS outages. All of them are validated at
+startup — a fee ceiling below the base fee fails the boot rather than every
+transaction.
+
+Micrometer counters for the signing pipeline are exposed at
+`/actuator/prometheus`. Only `health`, `info` and `prometheus` are enabled, and
+none of them is public, so a scraper needs a bearer token or an in-cluster
+network policy; see [Metrics](docs/STELLAR_SIGNING.md#metrics).
 
 > **Security note:** this repository's git history (both the old `secret.properties`
 > committed file and, briefly, this repo's own earlier state) contains real

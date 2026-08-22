@@ -15,6 +15,7 @@ import java.io.IOException;
 import java.util.Base64;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
@@ -170,9 +171,52 @@ class KmsSigningProviderTest {
                 .hasMessageContaining("non-base64");
     }
 
+    /**
+     * The gateway is a signing oracle reachable over the network, so the size
+     * check happens <em>before</em> the key lookup: an oversized payload must
+     * not even produce a request, let alone reach a key.
+     */
+    @Test
+    void refusesToSendAnythingLargerThanATransactionHash() {
+        assertThatThrownBy(() -> provider.sign("channel1", new byte[64]))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("32-byte transaction hash")
+                .hasMessageContaining("64 bytes");
+        assertThatThrownBy(() -> provider.sign("channel1", new byte[33]))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> provider.sign("channel1", null))
+                .isInstanceOf(IllegalArgumentException.class);
+
+        assertThat(server.getRequestCount())
+                .withFailMessage("an oversized payload reached the gateway")
+                .isZero();
+    }
+
     @Test
     void neverRendersTheApiKey() {
         assertThat(provider.toString()).doesNotContain("gateway-token");
+    }
+
+    /**
+     * The API key travels on every request and the signature comes back on
+     * every response. Neither belongs in a log — the credential for obvious
+     * reasons, the response body because a gateway is free to echo the request
+     * into an error.
+     */
+    @Test
+    void neitherTheApiKeyNorTheGatewayBodyIsLogged() {
+        try (LogCapture logs = LogCapture.start()) {
+            enqueueKeyLookup(signingKey);
+            enqueueSignature(signingKey, signingKey);
+            provider.sign("channel1", MESSAGE);
+
+            server.enqueue(new MockResponse().setResponseCode(500).setBody("gateway-token leaked in an error body"));
+            assertThatThrownBy(() -> provider.publicKey("channel2")).isInstanceOf(SigningProviderException.class);
+
+            org.slf4j.LoggerFactory.getLogger(KmsSigningProviderTest.class).info("provider={}", provider);
+
+            assertThat(logs.output()).doesNotContain("gateway-token");
+        }
     }
 
     /** Misconfiguration should stop the context starting, not fail on the first signature. */
@@ -184,5 +228,50 @@ class KmsSigningProviderTest {
         assertThatThrownBy(() -> new KmsSigningProvider(new OkHttpClient(), new ObjectMapper(), unconfigured))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("stellar.signing.kms.url");
+    }
+
+    /**
+     * Cleartext to a signing gateway leaks the bearer credential and, worse,
+     * lets anything on the path substitute the signature that comes back.
+     * Loopback is exempt (this test's own MockWebServer, and the sidecar-proxy
+     * deployment shape) because there is no network path to observe.
+     */
+    @Test
+    void refusesToStartAgainstAPlaintextGateway() {
+        SigningProperties insecure = new SigningProperties();
+        insecure.setProvider("kms");
+        insecure.getKms().setUrl("http://kms.internal/stellar");
+        insecure.getKms().setApiKey("gateway-token");
+
+        assertThatThrownBy(() -> new KmsSigningProvider(new OkHttpClient(), new ObjectMapper(), insecure))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("must use https");
+
+        insecure.getKms().setUrl("https://kms.internal/stellar");
+        assertThatCode(() -> new KmsSigningProvider(new OkHttpClient(), new ObjectMapper(), insecure))
+                .doesNotThrowAnyException();
+    }
+
+    @Test
+    void refusesToStartAgainstAnUnauthenticatedGateway() {
+        SigningProperties noCredential = new SigningProperties();
+        noCredential.setProvider("kms");
+        noCredential.getKms().setUrl("https://kms.internal/stellar");
+
+        assertThatThrownBy(() -> new KmsSigningProvider(new OkHttpClient(), new ObjectMapper(), noCredential))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("stellar.signing.kms.api-key");
+    }
+
+    @Test
+    void refusesToStartAgainstAnUnparseableUrl() {
+        SigningProperties broken = new SigningProperties();
+        broken.setProvider("kms");
+        broken.getKms().setUrl("not a url");
+        broken.getKms().setApiKey("gateway-token");
+
+        assertThatThrownBy(() -> new KmsSigningProvider(new OkHttpClient(), new ObjectMapper(), broken))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("valid http(s) URL");
     }
 }

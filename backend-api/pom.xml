@@ -45,6 +45,21 @@
 			<artifactId>spring-boot-starter-data-jpa</artifactId>
 		</dependency>
 
+		<!-- Micrometer, for the submission-pipeline counters. Actuator brings
+		     micrometer-core and the /actuator/prometheus endpoint; the registry
+		     is runtime-scoped because nothing compiles against it. Both
+		     endpoints sit behind `anyRequest().authenticated()` — see
+		     docs/STELLAR_SIGNING.md ("Metrics"). -->
+		<dependency>
+			<groupId>org.springframework.boot</groupId>
+			<artifactId>spring-boot-starter-actuator</artifactId>
+		</dependency>
+		<dependency>
+			<groupId>io.micrometer</groupId>
+			<artifactId>micrometer-registry-prometheus</artifactId>
+			<scope>runtime</scope>
+		</dependency>
+
 		<dependency>
 			<groupId>org.postgresql</groupId>
 			<artifactId>postgresql</artifactId>

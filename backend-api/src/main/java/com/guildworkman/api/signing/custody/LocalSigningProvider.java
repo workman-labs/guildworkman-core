@@ -89,6 +89,7 @@ public class LocalSigningProvider implements SigningProvider {
 
     @Override
     public byte[] sign(String keyRef, byte[] message) {
+        SigningMessages.requireTransactionHash(keyRef, message);
         return require(keyRef).sign(message);
     }
 
