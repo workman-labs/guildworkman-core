@@ -17,7 +17,8 @@ sections start once something ships.
 ### Added
 
 - **Cross-contract settlement router with auth-chained escrow → reputation →
-  loyalty atomicity** ([#38](https://github.com/workman-labs/guildworkman-core/issues/38)).
+  loyalty atomicity** ([#38](https://github.com/workman-labs/guildworkman-core/issues/38),
+  [PR #50](https://github.com/workman-labs/guildworkman-core/pull/50)).
   A new `contracts/settlement-router` crate that atomically drives escrow
   release, reputation attestation, and loyalty emission from a single
   `settle(appointment_id, rating, attestation_hash)` call, so a completed
