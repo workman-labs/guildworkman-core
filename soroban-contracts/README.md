@@ -7,7 +7,7 @@ marketplace. This workspace has six independent contracts:
 
 | Contract | Path | Purpose |
 |---|---|---|
-| `escrow` | `contracts/escrow` | Holds a client's payment for a booked appointment until the client confirms the job is done; releases funds to the skilled worker, refunds on cancellation, and supports admin-arbitrated disputes. |
+| `escrow` | `contracts/escrow` | Holds a client's payment for a booked appointment until the client confirms the job is done; releases funds to the skilled worker (split across a protocol treasury cut and an optional referrer share — see [Protocol fee engine](#protocol-fee-engine)), refunds in full on cancellation, and supports admin-arbitrated disputes. |
 | `reputation` | `contracts/reputation` | Stores one immutable review per completed appointment and keeps a running rating aggregate per skilled worker. |
 | `loyalty-token` | `contracts/loyalty-token` | A SEP-41-style fungible token used to reward clients/workers with points on completed appointments. Only a designated `minter` (the backend's service account) can mint. |
 | `loyalty-emissions` | `contracts/loyalty-emissions` | An emission engine that owns the `loyalty-token`'s `minter` role. Instead of minting rewards in a lump sum, it streams them out of per-account linear vesting schedules, throttled by per-account and global rate limits, and lets the admin reclaim allocations left unclaimed past a deadline. |
@@ -569,22 +569,61 @@ stellar contract invoke --id $REPUTATION --source admin --network testnet \
 
 ### escrow
 
-- `initialize(admin: Address, governance_init: GovernanceInit)`
-- `create_appointment(appointment_id: u64, client: Address, worker: Address, token: Address, amount: i128)`
-- `confirm_completion(appointment_id: u64)` — client-only, pays the worker
-- `cancel_appointment(appointment_id: u64)` — client-only, refunds the client
+- `initialize(admin: Address, governance_init: GovernanceInit)` — writes no `FeeConfig` entry; `get_fee_config` treats that as `{0, 0}` (no fees) until `set_fee_config` is called
+- `create_appointment(appointment_id: u64, client: Address, worker: Address, token: Address, amount: i128, referrer: Option<Address>)`
+- `confirm_completion(appointment_id: u64)` — client-only, pays the worker (split per [Protocol fee engine](#protocol-fee-engine))
+- `cancel_appointment(appointment_id: u64)` — client-only, refunds the client **in full, no fee taken**
 - `raise_dispute(appointment_id: u64, caller: Address)` — client or worker
-- `resolve_dispute(appointment_id: u64, refund_to_client: bool)` — admin-only
+- `resolve_dispute(appointment_id: u64, refund_to_client: bool)` — admin-only; refunding the client takes no fee, paying the worker applies the same split as `confirm_completion`
 - `get_appointment(appointment_id: u64) -> Appointment`
+- `set_fee_config(caller: Address, config: FeeConfig)` — any governance signer; rejects a combined `protocol_bps + referrer_bps` above `MAX_TOTAL_FEE_BPS` (1,500 = 15%) unconditionally
+- `get_fee_config() -> FeeConfig`
+- `get_treasury_balance(token: Address) -> i128`
+- `withdraw_treasury(caller: Address, token: Address, to: Address, amount: i128)` — any governance signer
 - `propose_upgrade`, `approve_upgrade`, `cancel_upgrade`, `migrate`, `get_signers`, `get_upgrade_threshold`, `get_pending_upgrade`, `get_storage_version` — see [Upgrade governance](#upgrade-governance)
 - `pause`, `unpause`, `get_pause_state`, `paused_scopes`, `is_paused` — see [Emergency circuit breaker](#emergency-circuit-breaker)
+
+#### Protocol fee engine
+
+`confirm_completion` and the worker-favoring branch of `resolve_dispute`
+split the escrowed `amount` three ways instead of paying it out whole:
+
+- **Protocol share** — `floor(amount * fee_config.protocol_bps / 10_000)`,
+  credited to this contract's per-token treasury balance rather than
+  transferred out immediately.
+- **Referrer share** — `floor(amount * fee_config.referrer_bps / 10_000)`,
+  paid directly to `appointment.referrer` when it's `Some`; zero when it's
+  `None` (the common case — most appointments have no referrer).
+- **Worker share** — the remainder, `amount - protocol_share -
+  referrer_share`. The worker absorbs the rounding remainder by design: this
+  guarantees `worker_share + protocol_share + referrer_share == amount`
+  exactly for every `amount`, including `1`-unit amounts and
+  `i128::MAX`-adjacent ones — no path can ever pay out more than was
+  escrowed, and no dust is ever left stranded.
+
+`protocol_bps + referrer_bps` can never exceed `MAX_TOTAL_FEE_BPS` (1,500 bps
+= 15%) — checked in `set_fee_config` itself regardless of caller, so no
+governance signer can configure a combined take-rate above it. The worker is
+guaranteed at least 85% of every settled appointment.
+
+**Fees are not applied uniformly to every payout path, on purpose:**
+`cancel_appointment` and the refund-to-client branch of `resolve_dispute`
+return the full `amount` to the client with no fee at all — the protocol
+only takes a cut when a service was actually delivered and the worker gets
+paid. A client being refunded for work that never happened keeps their
+money whole.
+
+Treasury balances accrue per token in `DataKey::Treasury(token)` and leave
+only through `withdraw_treasury`, gated the same way as `set_fee_config`.
 
 #### Storage layout
 
 | `DataKey` variant | Storage | Holds |
 |---|---|---|
 | `Admin` | instance | The dispute arbiter's `Address`, set once in `initialize`. |
-| `Appointment(u64)` | persistent | An `Appointment { client, worker, token, amount, status }` keyed by `appointment_id`. `status` is one of `Funded`, `Completed`, `Cancelled`, `Disputed`, `Resolved`. |
+| `Appointment(u64)` | persistent | An `Appointment { client, worker, token, amount, status, referrer }` keyed by `appointment_id`. `status` is one of `Funded`, `Completed`, `Cancelled`, `Disputed`, `Resolved`. `referrer` is `Some(Address)` for the minority of appointments that have one. |
+| `FeeConfig` | instance | `FeeConfig { protocol_bps, referrer_bps }`. Absent until `set_fee_config` is first called — `initialize` deliberately writes no entry, so instance storage is unchanged for a contract that never sets fees — and `get_fee_config` treats absence as `{0, 0}`. |
+| `Treasury(Address)` | persistent | The accumulated, withdrawable protocol fee balance for that token `Address`. |
 
 #### Errors
 
@@ -608,6 +647,9 @@ stellar contract invoke --id $REPUTATION --source admin --network testnet \
 | `HashMismatch` | 16 | `approve_upgrade` with a hash that doesn't match the pending proposal. |
 | `AlreadyMigrated` | 17 | `migrate` targeting a version already applied or behind the current one. |
 | `NothingToMigrate` | 18 | `migrate` called when the stored version is already current. |
+| `FeeExceedsMaximum` | 42 | `set_fee_config` with `protocol_bps + referrer_bps` above `MAX_TOTAL_FEE_BPS`. |
+| `ArithmeticOverflow` | 43 | A checked arithmetic step in the fee split or treasury bookkeeping would have overflowed `i128`. |
+| `InsufficientTreasuryBalance` | 44 | `withdraw_treasury` requested more than the token's tracked treasury balance. |
 
 Codes 19-36 (milestone escrow and signer rotation) are documented in
 `src/lib.rs`; codes 37-41 are the circuit breaker's, listed in
@@ -621,16 +663,16 @@ stellar contract invoke --id $ESCROW --source admin --network testnet \
   -- initialize --admin $ADMIN_ADDR \
      --governance_init '{"signers":["'$SIGNER_1'","'$SIGNER_2'","'$SIGNER_3'"],"threshold":2}'
 
-# Client books worker WORKER_ADDR, depositing 10000 units of TOKEN_ADDR, appointment id 1
+# Client books worker WORKER_ADDR, depositing 10000 units of TOKEN_ADDR, appointment id 1, no referrer
 stellar contract invoke --id $ESCROW --source client --network testnet \
   -- create_appointment --appointment_id 1 --client $CLIENT_ADDR \
-     --worker $WORKER_ADDR --token $TOKEN_ADDR --amount 10000
+     --worker $WORKER_ADDR --token $TOKEN_ADDR --amount 10000 --referrer null
 
-# Client confirms the job is done -> pays the worker
+# Client confirms the job is done -> pays the worker, split per the fee engine
 stellar contract invoke --id $ESCROW --source client --network testnet \
   -- confirm_completion --appointment_id 1
 
-# Client cancels before completion -> refunds the client
+# Client cancels before completion -> refunds the client in full, no fee
 stellar contract invoke --id $ESCROW --source client --network testnet \
   -- cancel_appointment --appointment_id 1
 
@@ -638,13 +680,27 @@ stellar contract invoke --id $ESCROW --source client --network testnet \
 stellar contract invoke --id $ESCROW --source client --network testnet \
   -- raise_dispute --appointment_id 1 --caller $CLIENT_ADDR
 
-# Admin resolves the dispute in the worker's favor
+# Admin resolves the dispute in the worker's favor (fee split applies)
 stellar contract invoke --id $ESCROW --source admin --network testnet \
   -- resolve_dispute --appointment_id 1 --refund_to_client false
 
 # Read appointment state
 stellar contract invoke --id $ESCROW --source admin --network testnet \
   -- get_appointment --appointment_id 1
+
+# A governance signer sets a 10% protocol fee + 5% referrer fee (15% = the cap)
+stellar contract invoke --id $ESCROW --source signer_1 --network testnet \
+  -- set_fee_config --caller $SIGNER_1_ADDR \
+     --config '{"protocol_bps":1000,"referrer_bps":500}'
+
+# Read the accumulated protocol treasury balance for TOKEN_ADDR
+stellar contract invoke --id $ESCROW --source admin --network testnet \
+  -- get_treasury_balance --token $TOKEN_ADDR
+
+# A governance signer withdraws the treasury balance to TREASURY_WALLET
+stellar contract invoke --id $ESCROW --source signer_1 --network testnet \
+  -- withdraw_treasury --caller $SIGNER_1_ADDR --token $TOKEN_ADDR \
+     --to $TREASURY_WALLET_ADDR --amount 1000
 ```
 
 ### reputation

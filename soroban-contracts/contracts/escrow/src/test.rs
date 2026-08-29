@@ -76,7 +76,7 @@ fn happy_path_completion_pays_worker() {
     let ctx = setup();
 
     ctx.contract
-        .create_appointment(&1, &ctx.client, &ctx.worker, &ctx.token, &10_000);
+        .create_appointment(&1, &ctx.client, &ctx.worker, &ctx.token, &10_000, &None);
     assert_eq!(ctx.token_client.balance(&ctx.client), 990_000);
     assert_eq!(ctx.token_client.balance(&ctx.contract.address), 10_000);
 
@@ -93,7 +93,7 @@ fn cancel_refunds_client() {
     let ctx = setup();
 
     ctx.contract
-        .create_appointment(&2, &ctx.client, &ctx.worker, &ctx.token, &5_000);
+        .create_appointment(&2, &ctx.client, &ctx.worker, &ctx.token, &5_000, &None);
     ctx.contract.cancel_appointment(&2);
 
     assert_eq!(ctx.token_client.balance(&ctx.client), 1_000_000);
@@ -106,7 +106,7 @@ fn dispute_resolved_in_favor_of_worker() {
     let ctx = setup();
 
     ctx.contract
-        .create_appointment(&3, &ctx.client, &ctx.worker, &ctx.token, &7_000);
+        .create_appointment(&3, &ctx.client, &ctx.worker, &ctx.token, &7_000, &None);
     ctx.contract.raise_dispute(&3, &ctx.client);
     assert_eq!(ctx.contract.get_appointment(&3).status, Status::Disputed);
 
@@ -119,11 +119,16 @@ fn dispute_resolved_in_favor_of_worker() {
 fn duplicate_appointment_id_rejected() {
     let ctx = setup();
     ctx.contract
-        .create_appointment(&4, &ctx.client, &ctx.worker, &ctx.token, &1_000);
+        .create_appointment(&4, &ctx.client, &ctx.worker, &ctx.token, &1_000, &None);
 
-    let result =
-        ctx.contract
-            .try_create_appointment(&4, &ctx.client, &ctx.worker, &ctx.token, &1_000);
+    let result = ctx.contract.try_create_appointment(
+        &4,
+        &ctx.client,
+        &ctx.worker,
+        &ctx.token,
+        &1_000,
+        &None,
+    );
     assert_eq!(result, Err(Ok(Error::AppointmentExists)));
 }
 
@@ -131,11 +136,439 @@ fn duplicate_appointment_id_rejected() {
 fn cannot_confirm_twice() {
     let ctx = setup();
     ctx.contract
-        .create_appointment(&5, &ctx.client, &ctx.worker, &ctx.token, &2_000);
+        .create_appointment(&5, &ctx.client, &ctx.worker, &ctx.token, &2_000, &None);
     ctx.contract.confirm_completion(&5);
 
     let result = ctx.contract.try_confirm_completion(&5);
     assert_eq!(result, Err(Ok(Error::InvalidStatus)));
+}
+
+// ===========================================================================
+// Protocol fee engine
+// ===========================================================================
+
+fn set_fee(ctx: &TestCtx, protocol_bps: u32, referrer_bps: u32) {
+    ctx.contract.set_fee_config(
+        &ctx.signers.get_unchecked(0),
+        &FeeConfig {
+            protocol_bps,
+            referrer_bps,
+        },
+    );
+}
+
+#[test]
+fn fee_config_defaults_to_zero() {
+    let ctx = setup();
+    let config = ctx.contract.get_fee_config();
+    assert_eq!(config.protocol_bps, 0);
+    assert_eq!(config.referrer_bps, 0);
+}
+
+#[test]
+fn set_fee_config_by_signer_succeeds() {
+    let ctx = setup();
+    set_fee(&ctx, 1_000, 500);
+    let config = ctx.contract.get_fee_config();
+    assert_eq!(config.protocol_bps, 1_000);
+    assert_eq!(config.referrer_bps, 500);
+}
+
+#[test]
+fn set_fee_config_by_non_signer_rejected() {
+    let ctx = setup();
+    let outsider = Address::generate(&ctx.env);
+    let res = ctx.contract.try_set_fee_config(
+        &outsider,
+        &FeeConfig {
+            protocol_bps: 100,
+            referrer_bps: 0,
+        },
+    );
+    assert_eq!(res, Err(Ok(Error::NotASigner)));
+}
+
+#[test]
+fn set_fee_config_by_admin_arbiter_rejected() {
+    // `admin` resolves disputes but is not a governance signer — the same
+    // separation of powers `the_admin_arbiter_is_not_a_pause_authority`
+    // pins down for the circuit breaker applies here too.
+    let ctx = setup();
+    let res = ctx.contract.try_set_fee_config(
+        &ctx.admin,
+        &FeeConfig {
+            protocol_bps: 100,
+            referrer_bps: 0,
+        },
+    );
+    assert_eq!(res, Err(Ok(Error::NotASigner)));
+}
+
+#[test]
+fn set_fee_config_at_exact_cap_accepted() {
+    let ctx = setup();
+    set_fee(&ctx, 1_000, MAX_TOTAL_FEE_BPS - 1_000);
+    let config = ctx.contract.get_fee_config();
+    assert_eq!(config.protocol_bps + config.referrer_bps, MAX_TOTAL_FEE_BPS);
+}
+
+#[test]
+fn set_fee_config_above_cap_rejected() {
+    let ctx = setup();
+    let res = ctx.contract.try_set_fee_config(
+        &ctx.signers.get_unchecked(0),
+        &FeeConfig {
+            protocol_bps: 1_000,
+            referrer_bps: MAX_TOTAL_FEE_BPS - 1_000 + 1,
+        },
+    );
+    assert_eq!(res, Err(Ok(Error::FeeExceedsMaximum)));
+    // Rejected atomically — the default is untouched.
+    let config = ctx.contract.get_fee_config();
+    assert_eq!(config.protocol_bps, 0);
+    assert_eq!(config.referrer_bps, 0);
+}
+
+#[test]
+fn set_fee_config_protocol_alone_above_cap_rejected() {
+    let ctx = setup();
+    let res = ctx.contract.try_set_fee_config(
+        &ctx.signers.get_unchecked(0),
+        &FeeConfig {
+            protocol_bps: MAX_TOTAL_FEE_BPS + 1,
+            referrer_bps: 0,
+        },
+    );
+    assert_eq!(res, Err(Ok(Error::FeeExceedsMaximum)));
+}
+
+#[test]
+fn confirm_completion_splits_protocol_fee_with_no_referrer() {
+    let ctx = setup();
+    set_fee(&ctx, 1_000, 500); // 10% protocol, 5% referrer — no referrer here
+
+    ctx.contract
+        .create_appointment(&1, &ctx.client, &ctx.worker, &ctx.token, &10_000, &None);
+    ctx.contract.confirm_completion(&1);
+
+    // No referrer on this appointment, so referrer_bps contributes nothing —
+    // the worker absorbs it as part of the remainder.
+    assert_eq!(ctx.token_client.balance(&ctx.worker), 9_000);
+    assert_eq!(ctx.contract.get_treasury_balance(&ctx.token), 1_000);
+    // The protocol share stays in the contract's own token balance until
+    // `withdraw_treasury` moves it out.
+    assert_eq!(ctx.token_client.balance(&ctx.contract.address), 1_000);
+}
+
+#[test]
+fn confirm_completion_splits_three_ways_with_referrer() {
+    let ctx = setup();
+    set_fee(&ctx, 1_000, 500);
+    let referrer = Address::generate(&ctx.env);
+
+    ctx.contract.create_appointment(
+        &1,
+        &ctx.client,
+        &ctx.worker,
+        &ctx.token,
+        &10_000,
+        &Some(referrer.clone()),
+    );
+    ctx.contract.confirm_completion(&1);
+
+    assert_eq!(ctx.token_client.balance(&ctx.worker), 8_500);
+    assert_eq!(ctx.token_client.balance(&referrer), 500);
+    assert_eq!(ctx.contract.get_treasury_balance(&ctx.token), 1_000);
+    assert_eq!(ctx.token_client.balance(&ctx.contract.address), 1_000);
+}
+
+#[test]
+fn cancel_is_fee_free_even_with_nonzero_fee_config() {
+    let ctx = setup();
+    set_fee(&ctx, 1_000, 500);
+
+    ctx.contract
+        .create_appointment(&2, &ctx.client, &ctx.worker, &ctx.token, &10_000, &None);
+    ctx.contract.cancel_appointment(&2);
+
+    assert_eq!(ctx.token_client.balance(&ctx.client), 1_000_000);
+    assert_eq!(ctx.contract.get_treasury_balance(&ctx.token), 0);
+    assert_eq!(ctx.token_client.balance(&ctx.contract.address), 0);
+}
+
+#[test]
+fn dispute_refund_to_client_is_fee_free() {
+    let ctx = setup();
+    set_fee(&ctx, 1_000, 500);
+
+    ctx.contract
+        .create_appointment(&3, &ctx.client, &ctx.worker, &ctx.token, &7_000, &None);
+    ctx.contract.raise_dispute(&3, &ctx.client);
+    ctx.contract.resolve_dispute(&3, &true);
+
+    assert_eq!(ctx.token_client.balance(&ctx.client), 1_000_000);
+    assert_eq!(ctx.contract.get_treasury_balance(&ctx.token), 0);
+    assert_eq!(ctx.token_client.balance(&ctx.contract.address), 0);
+}
+
+#[test]
+fn dispute_resolved_to_worker_applies_fee_split() {
+    let ctx = setup();
+    set_fee(&ctx, 1_000, 0);
+
+    ctx.contract
+        .create_appointment(&3, &ctx.client, &ctx.worker, &ctx.token, &7_000, &None);
+    ctx.contract.raise_dispute(&3, &ctx.client);
+    ctx.contract.resolve_dispute(&3, &false);
+
+    assert_eq!(ctx.token_client.balance(&ctx.worker), 6_300); // 90% of 7,000
+    assert_eq!(ctx.contract.get_treasury_balance(&ctx.token), 700);
+}
+
+#[test]
+fn withdraw_treasury_by_signer_succeeds() {
+    let ctx = setup();
+    set_fee(&ctx, 1_000, 0);
+    ctx.contract
+        .create_appointment(&1, &ctx.client, &ctx.worker, &ctx.token, &10_000, &None);
+    ctx.contract.confirm_completion(&1);
+    assert_eq!(ctx.contract.get_treasury_balance(&ctx.token), 1_000);
+
+    let treasury_recipient = Address::generate(&ctx.env);
+    ctx.contract.withdraw_treasury(
+        &ctx.signers.get_unchecked(1),
+        &ctx.token,
+        &treasury_recipient,
+        &1_000,
+    );
+
+    assert_eq!(ctx.contract.get_treasury_balance(&ctx.token), 0);
+    assert_eq!(ctx.token_client.balance(&treasury_recipient), 1_000);
+    assert_eq!(ctx.token_client.balance(&ctx.contract.address), 0);
+}
+
+#[test]
+fn withdraw_treasury_more_than_balance_rejected() {
+    let ctx = setup();
+    set_fee(&ctx, 1_000, 0);
+    ctx.contract
+        .create_appointment(&1, &ctx.client, &ctx.worker, &ctx.token, &10_000, &None);
+    ctx.contract.confirm_completion(&1);
+
+    let treasury_recipient = Address::generate(&ctx.env);
+    let res = ctx.contract.try_withdraw_treasury(
+        &ctx.signers.get_unchecked(0),
+        &ctx.token,
+        &treasury_recipient,
+        &1_001,
+    );
+    assert_eq!(res, Err(Ok(Error::InsufficientTreasuryBalance)));
+    // Untouched by the rejected attempt.
+    assert_eq!(ctx.contract.get_treasury_balance(&ctx.token), 1_000);
+}
+
+#[test]
+fn withdraw_treasury_by_non_signer_rejected() {
+    let ctx = setup();
+    set_fee(&ctx, 1_000, 0);
+    ctx.contract
+        .create_appointment(&1, &ctx.client, &ctx.worker, &ctx.token, &10_000, &None);
+    ctx.contract.confirm_completion(&1);
+
+    let outsider = Address::generate(&ctx.env);
+    let treasury_recipient = Address::generate(&ctx.env);
+    let res =
+        ctx.contract
+            .try_withdraw_treasury(&outsider, &ctx.token, &treasury_recipient, &1_000);
+    assert_eq!(res, Err(Ok(Error::NotASigner)));
+}
+
+#[test]
+fn withdraw_treasury_zero_amount_rejected() {
+    let ctx = setup();
+    let treasury_recipient = Address::generate(&ctx.env);
+    let res = ctx.contract.try_withdraw_treasury(
+        &ctx.signers.get_unchecked(0),
+        &ctx.token,
+        &treasury_recipient,
+        &0,
+    );
+    assert_eq!(res, Err(Ok(Error::InvalidAmount)));
+}
+
+// ----- Adversarial edge cases -----
+
+#[test]
+fn one_unit_amount_rounds_entirely_to_worker() {
+    let ctx = setup();
+    set_fee(&ctx, 1_000, 500); // 15% combined still floors to 0 on amount=1
+
+    ctx.contract
+        .create_appointment(&1, &ctx.client, &ctx.worker, &ctx.token, &1, &None);
+    ctx.contract.confirm_completion(&1);
+
+    assert_eq!(ctx.token_client.balance(&ctx.worker), 1);
+    assert_eq!(ctx.contract.get_treasury_balance(&ctx.token), 0);
+}
+
+#[test]
+fn near_i128_max_amount_splits_without_overflow_or_dust() {
+    let ctx = setup();
+    set_fee(&ctx, 1_000, 500);
+    let referrer = Address::generate(&ctx.env);
+    let big_client = Address::generate(&ctx.env);
+
+    // A fresh address minted exactly this amount, so the token's own total
+    // supply never has to represent more than `i128::MAX`.
+    let huge = i128::MAX - 7;
+    ctx.token_admin.mint(&big_client, &huge);
+
+    ctx.contract.create_appointment(
+        &1,
+        &big_client,
+        &ctx.worker,
+        &ctx.token,
+        &huge,
+        &Some(referrer.clone()),
+    );
+    ctx.contract.confirm_completion(&1);
+
+    let worker_bal = ctx.token_client.balance(&ctx.worker);
+    let referrer_bal = ctx.token_client.balance(&referrer);
+    let treasury_bal = ctx.contract.get_treasury_balance(&ctx.token);
+
+    assert_eq!(worker_bal + referrer_bal + treasury_bal, huge);
+    assert_eq!(
+        ctx.token_client.balance(&ctx.contract.address),
+        treasury_bal
+    );
+}
+
+#[test]
+fn zero_fee_config_pays_worker_in_full() {
+    let ctx = setup();
+    // Fee config defaults to zero — explicit here for clarity.
+    set_fee(&ctx, 0, 0);
+    let referrer = Address::generate(&ctx.env);
+
+    ctx.contract.create_appointment(
+        &1,
+        &ctx.client,
+        &ctx.worker,
+        &ctx.token,
+        &10_000,
+        &Some(referrer.clone()),
+    );
+    ctx.contract.confirm_completion(&1);
+
+    assert_eq!(ctx.token_client.balance(&ctx.worker), 10_000);
+    assert_eq!(ctx.token_client.balance(&referrer), 0);
+    assert_eq!(ctx.contract.get_treasury_balance(&ctx.token), 0);
+}
+
+#[test]
+fn max_fee_config_still_leaves_worker_the_floor_share() {
+    let ctx = setup();
+    set_fee(&ctx, MAX_TOTAL_FEE_BPS, 0); // entire cap taken by the protocol
+
+    ctx.contract
+        .create_appointment(&1, &ctx.client, &ctx.worker, &ctx.token, &10_000, &None);
+    ctx.contract.confirm_completion(&1);
+
+    assert_eq!(ctx.token_client.balance(&ctx.worker), 8_500);
+    assert_eq!(ctx.contract.get_treasury_balance(&ctx.token), 1_500);
+}
+
+#[test]
+fn split_invariant_holds_across_amounts_and_fee_configs() {
+    // sum(worker_share, protocol_share, referrer_share) == amount, for every
+    // combination of adversarial amounts (1-unit and i128::MAX-adjacent, plus
+    // a spread in between) and fee configs at the edges of what's allowed:
+    // zero, max-protocol-only, max-referrer-only, and split down the middle.
+    let ctx = setup();
+
+    let amounts: [i128; 8] = [
+        1,
+        2,
+        9_999,
+        10_000,
+        10_001,
+        1_000_000_000_000,
+        i128::MAX - 1,
+        i128::MAX,
+    ];
+    let configs = [
+        FeeConfig {
+            protocol_bps: 0,
+            referrer_bps: 0,
+        },
+        FeeConfig {
+            protocol_bps: MAX_TOTAL_FEE_BPS,
+            referrer_bps: 0,
+        },
+        FeeConfig {
+            protocol_bps: 0,
+            referrer_bps: MAX_TOTAL_FEE_BPS,
+        },
+        FeeConfig {
+            protocol_bps: 750,
+            referrer_bps: 750,
+        },
+    ];
+
+    let mut appointment_id = 100u64;
+    for config in configs {
+        set_fee(&ctx, config.protocol_bps, config.referrer_bps);
+
+        for &amount in amounts.iter() {
+            for has_referrer in [false, true] {
+                // A fresh token per case, so no prior iteration's residual
+                // contract balance (e.g. an unwithdrawn protocol share) can
+                // interact with this amount. That matters most for the
+                // `i128::MAX`-adjacent cases: even a few units of leftover
+                // balance on a shared token would overflow the token's own
+                // `i128` balance field the moment the contract tried to
+                // receive another near-max transfer.
+                let (token, token_admin, token_client) =
+                    create_token_contract(&ctx.env, &Address::generate(&ctx.env));
+
+                let payer = Address::generate(&ctx.env);
+                token_admin.mint(&payer, &amount);
+
+                let worker = Address::generate(&ctx.env);
+                let referrer_addr = Address::generate(&ctx.env);
+                let referrer = has_referrer.then(|| referrer_addr.clone());
+
+                appointment_id += 1;
+                ctx.contract.create_appointment(
+                    &appointment_id,
+                    &payer,
+                    &worker,
+                    &token,
+                    &amount,
+                    &referrer,
+                );
+                ctx.contract.confirm_completion(&appointment_id);
+
+                let worker_bal = token_client.balance(&worker);
+                let referrer_bal = if has_referrer {
+                    token_client.balance(&referrer_addr)
+                } else {
+                    0
+                };
+                // This token is brand new to this iteration, so the treasury
+                // balance it reports *is* this appointment's protocol share.
+                let treasury_bal = ctx.contract.get_treasury_balance(&token);
+
+                assert!(worker_bal >= 0 && referrer_bal >= 0 && treasury_bal >= 0);
+                assert_eq!(
+                    worker_bal + referrer_bal + treasury_bal,
+                    amount,
+                    "split did not reconcile for amount={amount}, config={config:?}, has_referrer={has_referrer}"
+                );
+            }
+        }
+    }
 }
 
 // ===========================================================================
@@ -821,9 +1254,14 @@ fn paused_intake_blocks_new_appointments_and_moves_no_money() {
     let ctx = setup();
     pause_everything(&ctx);
 
-    let res =
-        ctx.contract
-            .try_create_appointment(&1, &ctx.client, &ctx.worker, &ctx.token, &10_000);
+    let res = ctx.contract.try_create_appointment(
+        &1,
+        &ctx.client,
+        &ctx.worker,
+        &ctx.token,
+        &10_000,
+        &None,
+    );
     assert_eq!(res, Err(Ok(Error::OperationPaused)));
 
     // No funds entered the contract.
@@ -865,7 +1303,7 @@ fn a_client_can_still_cancel_and_be_refunded_while_everything_is_paused() {
     // every scope the breaker knows about halted at once.
     let ctx = setup();
     ctx.contract
-        .create_appointment(&1, &ctx.client, &ctx.worker, &ctx.token, &10_000);
+        .create_appointment(&1, &ctx.client, &ctx.worker, &ctx.token, &10_000, &None);
     assert_eq!(ctx.token_client.balance(&ctx.contract.address), 10_000);
 
     pause_everything(&ctx);
@@ -884,7 +1322,7 @@ fn a_client_can_still_cancel_and_be_refunded_while_everything_is_paused() {
 fn disputes_can_still_be_raised_and_resolved_while_everything_is_paused() {
     let ctx = setup();
     ctx.contract
-        .create_appointment(&1, &ctx.client, &ctx.worker, &ctx.token, &10_000);
+        .create_appointment(&1, &ctx.client, &ctx.worker, &ctx.token, &10_000, &None);
 
     pause_everything(&ctx);
 
@@ -920,7 +1358,7 @@ fn milestone_disputes_resolve_while_everything_is_paused() {
 fn pausing_intake_alone_leaves_settlement_working() {
     let ctx = setup();
     ctx.contract
-        .create_appointment(&1, &ctx.client, &ctx.worker, &ctx.token, &10_000);
+        .create_appointment(&1, &ctx.client, &ctx.worker, &ctx.token, &10_000, &None);
 
     set_time(&ctx.env, 1_000);
     ctx.contract.pause(
@@ -939,7 +1377,7 @@ fn pausing_intake_alone_leaves_settlement_working() {
 fn pausing_settlement_alone_blocks_payout_but_not_new_appointments() {
     let ctx = setup();
     ctx.contract
-        .create_appointment(&1, &ctx.client, &ctx.worker, &ctx.token, &10_000);
+        .create_appointment(&1, &ctx.client, &ctx.worker, &ctx.token, &10_000, &None);
 
     set_time(&ctx.env, 1_000);
     ctx.contract.pause(
@@ -955,7 +1393,7 @@ fn pausing_settlement_alone_blocks_payout_but_not_new_appointments() {
 
     // Intake was never named, so it is untouched.
     ctx.contract
-        .create_appointment(&2, &ctx.client, &ctx.worker, &ctx.token, &5_000);
+        .create_appointment(&2, &ctx.client, &ctx.worker, &ctx.token, &5_000, &None);
 }
 
 #[test]
@@ -993,9 +1431,14 @@ fn intake_resumes_on_its_own_once_the_pause_expires() {
     let ctx = setup();
     let start = pause_everything(&ctx);
 
-    let res =
-        ctx.contract
-            .try_create_appointment(&1, &ctx.client, &ctx.worker, &ctx.token, &10_000);
+    let res = ctx.contract.try_create_appointment(
+        &1,
+        &ctx.client,
+        &ctx.worker,
+        &ctx.token,
+        &10_000,
+        &None,
+    );
     assert_eq!(res, Err(Ok(Error::OperationPaused)));
 
     // No unpause transaction. Only the ledger clock advances.
@@ -1004,7 +1447,7 @@ fn intake_resumes_on_its_own_once_the_pause_expires() {
     assert_eq!(ctx.contract.paused_scopes(), 0);
     assert!(ctx.contract.get_pause_state().is_none());
     ctx.contract
-        .create_appointment(&1, &ctx.client, &ctx.worker, &ctx.token, &10_000);
+        .create_appointment(&1, &ctx.client, &ctx.worker, &ctx.token, &10_000, &None);
     assert_eq!(ctx.token_client.balance(&ctx.contract.address), 10_000);
 }
 
@@ -1038,7 +1481,7 @@ fn a_non_signer_cannot_pause_the_escrow() {
 
     // And business is genuinely unaffected, not merely reported as open.
     ctx.contract
-        .create_appointment(&1, &ctx.client, &ctx.worker, &ctx.token, &10_000);
+        .create_appointment(&1, &ctx.client, &ctx.worker, &ctx.token, &10_000, &None);
 }
 
 #[test]
@@ -1076,7 +1519,7 @@ fn any_single_signer_can_lift_a_pause_another_signer_placed() {
         .unpause(&ctx.signers.get_unchecked(2), &ALL_SCOPES);
     assert_eq!(remaining, 0);
     ctx.contract
-        .create_appointment(&1, &ctx.client, &ctx.worker, &ctx.token, &10_000);
+        .create_appointment(&1, &ctx.client, &ctx.worker, &ctx.token, &10_000, &None);
 }
 
 // ----- Partial lift & views -----
@@ -1085,7 +1528,7 @@ fn any_single_signer_can_lift_a_pause_another_signer_placed() {
 fn unpausing_intake_alone_reopens_bookings_while_settlement_stays_halted() {
     let ctx = setup();
     ctx.contract
-        .create_appointment(&1, &ctx.client, &ctx.worker, &ctx.token, &10_000);
+        .create_appointment(&1, &ctx.client, &ctx.worker, &ctx.token, &10_000, &None);
     pause_everything(&ctx);
 
     let remaining = ctx
@@ -1095,7 +1538,7 @@ fn unpausing_intake_alone_reopens_bookings_while_settlement_stays_halted() {
     assert_eq!(remaining & SCOPE_SETTLEMENT, SCOPE_SETTLEMENT);
 
     ctx.contract
-        .create_appointment(&2, &ctx.client, &ctx.worker, &ctx.token, &5_000);
+        .create_appointment(&2, &ctx.client, &ctx.worker, &ctx.token, &5_000, &None);
     let res = ctx.contract.try_confirm_completion(&1);
     assert_eq!(res, Err(Ok(Error::OperationPaused)));
 }
@@ -1192,6 +1635,7 @@ fn guard_overhead_on_create_appointment_stays_bounded() {
             &baseline_ctx.worker,
             &baseline_ctx.token,
             &10_000,
+            &None,
         );
     });
 
@@ -1213,6 +1657,7 @@ fn guard_overhead_on_create_appointment_stays_bounded() {
             &loaded_ctx.worker,
             &loaded_ctx.token,
             &10_000,
+            &None,
         );
     });
 
@@ -1235,7 +1680,7 @@ fn a_paused_call_costs_less_than_a_successful_one() {
     let ctx = setup();
     let allowed = cpu_cost_of(&ctx.env, || {
         ctx.contract
-            .create_appointment(&1, &ctx.client, &ctx.worker, &ctx.token, &10_000);
+            .create_appointment(&1, &ctx.client, &ctx.worker, &ctx.token, &10_000, &None);
     });
 
     set_time(&ctx.env, 1_000);
@@ -1246,9 +1691,14 @@ fn a_paused_call_costs_less_than_a_successful_one() {
         &reason(&ctx.contract.env),
     );
     let rejected = cpu_cost_of(&ctx.env, || {
-        let res =
-            ctx.contract
-                .try_create_appointment(&2, &ctx.client, &ctx.worker, &ctx.token, &10_000);
+        let res = ctx.contract.try_create_appointment(
+            &2,
+            &ctx.client,
+            &ctx.worker,
+            &ctx.token,
+            &10_000,
+            &None,
+        );
         assert_eq!(res, Err(Ok(Error::OperationPaused)));
     });
 
@@ -1279,7 +1729,7 @@ fn a_scope_escrow_has_no_entrypoints_for_is_a_well_formed_no_op() {
     // Accepted and recorded, but escrow has no attestation entrypoint, so
     // every one of its own paths stays open.
     ctx.contract
-        .create_appointment(&1, &ctx.client, &ctx.worker, &ctx.token, &10_000);
+        .create_appointment(&1, &ctx.client, &ctx.worker, &ctx.token, &10_000, &None);
     ctx.contract.confirm_completion(&1);
     assert_eq!(ctx.token_client.balance(&ctx.worker), 10_000);
 }

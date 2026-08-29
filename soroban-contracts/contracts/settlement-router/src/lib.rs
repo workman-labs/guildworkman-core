@@ -221,6 +221,7 @@ pub struct Appointment {
     pub token: Address,
     pub amount: i128,
     pub status: Status,
+    pub referrer: Option<Address>,
 }
 
 /// The subset of `escrow::Error` reachable through `get_appointment` and

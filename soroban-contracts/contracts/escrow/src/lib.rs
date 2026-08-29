@@ -21,6 +21,8 @@
 //! | `DataKey::Admin` | instance | `Address` | Admin/arbiter for dispute resolution |
 //! | `DataKey::Appointment(id)` | persistent | `Appointment` | Simple escrow state |
 //! | `DataKey::MilestoneEscrow(id)` | persistent | `MilestoneEscrow` | Milestone escrow state |
+//! | `DataKey::FeeConfig` | instance | `FeeConfig` | Protocol/referrer fee rates, in basis points. Absent until `set_fee_config` is first called; `get_fee_config` treats absence as `{0, 0}` |
+//! | `DataKey::Treasury(token)` | persistent | `i128` | Accumulated, per-token protocol fee balance awaiting withdrawal |
 //! | `GovernanceDataKey::*` | instance | governance-guard types | M-of-N upgrade governance, signer rotation, and the emergency pause record |
 //!
 //! ## Authorization model
@@ -32,7 +34,53 @@
 //! - `resolve_dispute` / `resolve_milestone_dispute`: admin/arbiter must authorize.
 //! - `release_milestone_funds`: permissionless once conditions are met.
 //! - `pause` / `unpause`: any single governance signer (not `admin`).
+//! - `set_fee_config` / `withdraw_treasury`: any single governance signer
+//!   (the same authority that can `migrate` storage) — see "Protocol fee
+//!   engine" below.
 //! - All functions follow checks-effects-interactions to prevent reentrancy.
+//!
+//! ## Protocol fee engine
+//!
+//! `confirm_completion` and the worker-favoring branch of `resolve_dispute`
+//! split the escrowed `amount` three ways instead of paying it out whole:
+//!
+//! - **Protocol share** — `amount * fee_config.protocol_bps / 10_000`,
+//!   floor-rounded, credited to this contract's per-token treasury balance
+//!   (`DataKey::Treasury(token)`) rather than transferred out immediately.
+//! - **Referrer share** — `amount * fee_config.referrer_bps / 10_000`,
+//!   floor-rounded, paid directly to `appointment.referrer` when it is
+//!   `Some`; zero when it is `None`. Most appointments have no referrer, and
+//!   this contributes nothing to their settlement path in that case.
+//! - **Worker share** — the remainder, `amount - protocol_share -
+//!   referrer_share`. Assigning the rounding remainder to the worker (rather
+//!   than to the protocol or the referrer) is the deterministic rounding
+//!   policy: it guarantees `worker_share + protocol_share + referrer_share
+//!   == amount` exactly for every `amount`, including `1`-unit amounts and
+//!   `i128::MAX`-adjacent ones, with no path ever able to pay out more than
+//!   was escrowed and no dust ever left stranded in the contract.
+//!
+//! `fee_config.protocol_bps + fee_config.referrer_bps` can never exceed
+//! [`MAX_TOTAL_FEE_BPS`] — a hard-coded ceiling checked in `set_fee_config`
+//! itself, independent of who is calling it, so no governance signer (nor
+//! anyone else) can configure a combined take-rate above it. That ceiling is
+//! also what keeps the worker's floor share provable: since both individual
+//! shares floor-round down and their basis points never sum past 10,000,
+//! `protocol_share + referrer_share <= amount` always holds, so
+//! `worker_share` can never go negative.
+//!
+//! **Fee behavior is deliberately not uniform across every payout path:**
+//! `cancel_appointment` and the refund-to-client branch of `resolve_dispute`
+//! transfer the full `amount` back to the client with **no fee taken at
+//! all**. The protocol only takes a cut when a service was actually
+//! delivered and the worker gets paid; a client being refunded for work
+//! that never happened keeps their money whole. This is why the fee engine
+//! is not "consistently applied everywhere" — it is consistently applied to
+//! every *worker-paying* path and consistently absent from every *refund*
+//! path.
+//!
+//! Treasury balances accrue per token and leave only through
+//! `withdraw_treasury`, which requires the same governance-signer
+//! authorization as `set_fee_config`.
 //!
 //! ## Emergency circuit breaker
 //!
@@ -90,6 +138,33 @@ pub struct Appointment {
     pub token: Address,
     pub amount: i128,
     pub status: Status,
+    /// Optional referrer/guild address entitled to `fee_config.referrer_bps`
+    /// of `amount` on a worker-paying settlement. `None` for the common case
+    /// of an appointment with no referrer.
+    pub referrer: Option<Address>,
+}
+
+/// Governance-bounded protocol fee configuration, in basis points (1 bps =
+/// 0.01%). `protocol_bps + referrer_bps` can never exceed
+/// [`MAX_TOTAL_FEE_BPS`]; see the "Protocol fee engine" section above.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
+pub struct FeeConfig {
+    /// Share of a worker-paying settlement credited to the protocol
+    /// treasury, in basis points.
+    pub protocol_bps: u32,
+    /// Share of a worker-paying settlement paid to `appointment.referrer`
+    /// when one is set, in basis points. Ignored when there is no referrer.
+    pub referrer_bps: u32,
+}
+
+/// The exact three-way split of a settled `amount`. Always satisfies
+/// `worker_share + protocol_share + referrer_share == amount`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PayoutSplit {
+    worker_share: i128,
+    protocol_share: i128,
+    referrer_share: i128,
 }
 
 #[contracttype]
@@ -149,6 +224,8 @@ pub enum DataKey {
     Admin,
     Appointment(u64),
     MilestoneEscrow(u64),
+    FeeConfig,
+    Treasury(Address),
 }
 
 #[contracterror]
@@ -199,6 +276,10 @@ pub enum Error {
     InvalidPauseDuration = 39,
     NotPaused = 40,
     InvalidPauseReason = 41,
+    // --- Protocol fee engine ---
+    FeeExceedsMaximum = 42,
+    ArithmeticOverflow = 43,
+    InsufficientTreasuryBalance = 44,
 }
 
 impl From<governance::GovernanceError> for Error {
@@ -232,6 +313,17 @@ impl From<governance::GovernanceError> for Error {
 const LEDGERS_THRESHOLD: u32 = 17_280; // ~1 day, in ledgers (5s/ledger)
 const LEDGERS_EXTEND_TO: u32 = 518_400; // ~30 days
 
+/// Denominator for basis-point fee math: 1 bps = 1 / 10_000.
+const BPS_DENOMINATOR: i128 = 10_000;
+
+/// Hard ceiling on `fee_config.protocol_bps + fee_config.referrer_bps`
+/// (1,500 bps = 15%), enforced unconditionally in `set_fee_config`
+/// regardless of caller. This is the protocol's documented maximum
+/// combined take-rate: no governance signer can configure anything above
+/// it, guaranteeing the worker always keeps at least 85% of a settled
+/// appointment.
+pub const MAX_TOTAL_FEE_BPS: u32 = 1_500;
+
 #[contract]
 pub struct EscrowContract;
 
@@ -253,9 +345,88 @@ impl EscrowContract {
         admin.require_auth();
         governance::init_governance(&env, governance_init)?;
         env.storage().instance().set(&DataKey::Admin, &admin);
+        // Fees are opt-in: no `DataKey::FeeConfig` entry is written here, so
+        // instance storage for a contract that never calls `set_fee_config`
+        // is unchanged from before this feature existed. `get_fee_config`
+        // treats an absent entry as `{0, 0}` (no fees).
         env.storage()
             .instance()
             .extend_ttl(LEDGERS_THRESHOLD, LEDGERS_EXTEND_TO);
+        Ok(())
+    }
+
+    /// Sets the protocol/referrer fee configuration. Authorized by any
+    /// single current governance signer (the same authority `migrate` and
+    /// `unpause` answer to) — but the combined rate is capped by
+    /// [`MAX_TOTAL_FEE_BPS`] unconditionally, so no signer can push it past
+    /// the documented maximum regardless of how many of them agree.
+    pub fn set_fee_config(env: Env, caller: Address, config: FeeConfig) -> Result<(), Error> {
+        governance::require_signer(&env, &caller)?;
+
+        let total = (config.protocol_bps as u64)
+            .checked_add(config.referrer_bps as u64)
+            .ok_or(Error::ArithmeticOverflow)?;
+        if total > MAX_TOTAL_FEE_BPS as u64 {
+            return Err(Error::FeeExceedsMaximum);
+        }
+
+        env.storage().instance().set(&DataKey::FeeConfig, &config);
+        Self::bump_instance(&env);
+        Ok(())
+    }
+
+    /// The current protocol fee configuration.
+    pub fn get_fee_config(env: Env) -> FeeConfig {
+        env.storage()
+            .instance()
+            .get(&DataKey::FeeConfig)
+            .unwrap_or_default()
+    }
+
+    /// The protocol treasury's accumulated, withdrawable balance for `token`.
+    pub fn get_treasury_balance(env: Env, token: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Treasury(token))
+            .unwrap_or(0)
+    }
+
+    /// Withdraws `amount` of `token` from the protocol treasury to `to`.
+    /// Authorized by any single current governance signer.
+    ///
+    /// **Deliberately unguarded by the circuit breaker** for the same
+    /// reason `resolve_dispute` is: it only ever moves money that is
+    /// already the protocol's, out to a destination the signers choose, and
+    /// has no path that can strand or seize anyone else's funds.
+    pub fn withdraw_treasury(
+        env: Env,
+        caller: Address,
+        token: Address,
+        to: Address,
+        amount: i128,
+    ) -> Result<(), Error> {
+        governance::require_signer(&env, &caller)?;
+
+        if amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        let key = DataKey::Treasury(token.clone());
+        let balance: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        let remaining = balance
+            .checked_sub(amount)
+            .filter(|v| *v >= 0)
+            .ok_or(Error::InsufficientTreasuryBalance)?;
+
+        // Effects before interactions.
+        env.storage().persistent().set(&key, &remaining);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, LEDGERS_THRESHOLD, LEDGERS_EXTEND_TO);
+
+        let token_client = token::Client::new(&env, &token);
+        token_client.transfer(&env.current_contract_address(), &to, &amount);
+
         Ok(())
     }
 
@@ -413,6 +584,7 @@ impl EscrowContract {
         worker: Address,
         token: Address,
         amount: i128,
+        referrer: Option<Address>,
     ) -> Result<(), Error> {
         // Guard first, before auth and before any storage read: a halted
         // operation should cost nothing and reveal nothing beyond the
@@ -439,6 +611,7 @@ impl EscrowContract {
             token,
             amount,
             status: Status::Funded,
+            referrer,
         };
         env.storage().persistent().set(&key, &appointment);
         env.storage()
@@ -467,12 +640,7 @@ impl EscrowContract {
             return Err(Error::InvalidStatus);
         }
 
-        let token_client = token::Client::new(&env, &appointment.token);
-        token_client.transfer(
-            &env.current_contract_address(),
-            &appointment.worker,
-            &appointment.amount,
-        );
+        Self::pay_worker_with_fee_split(&env, &appointment)?;
 
         appointment.status = Status::Completed;
         env.storage().persistent().set(&key, &appointment);
@@ -556,17 +724,19 @@ impl EscrowContract {
             return Err(Error::InvalidStatus);
         }
 
-        let token_client = token::Client::new(&env, &appointment.token);
-        let recipient = if refund_to_client {
-            &appointment.client
+        if refund_to_client {
+            // No service was delivered, so — same reasoning as
+            // `cancel_appointment` — no fee is charged: the client gets the
+            // full amount back.
+            let token_client = token::Client::new(&env, &appointment.token);
+            token_client.transfer(
+                &env.current_contract_address(),
+                &appointment.client,
+                &appointment.amount,
+            );
         } else {
-            &appointment.worker
-        };
-        token_client.transfer(
-            &env.current_contract_address(),
-            recipient,
-            &appointment.amount,
-        );
+            Self::pay_worker_with_fee_split(&env, &appointment)?;
+        }
 
         appointment.status = Status::Resolved;
         env.storage().persistent().set(&key, &appointment);
@@ -952,6 +1122,115 @@ impl EscrowContract {
         env.storage()
             .instance()
             .extend_ttl(LEDGERS_THRESHOLD, LEDGERS_EXTEND_TO);
+    }
+
+    // ===========================================================================
+    // Protocol fee engine — internal helpers
+    // ===========================================================================
+
+    /// `floor(amount * bps / BPS_DENOMINATOR)`, computed without the
+    /// intermediate `amount * bps` ever overflowing `i128` even for
+    /// `amount` near `i128::MAX` and `bps` up to 10_000 (100%).
+    ///
+    /// Standard split-multiply identity: with `q = amount / D` and
+    /// `r = amount % D`, `amount * bps == q * bps * D + r * bps`, so
+    /// `floor(amount * bps / D) == q * bps + floor(r * bps / D)`. `q * bps`
+    /// is bounded by `amount`'s own magnitude (no growth from `D`), and
+    /// `r * bps < D * bps <= 10_000 * 10_000`, nowhere near overflowing.
+    fn floor_bps_share(amount: i128, bps: u32) -> Result<i128, Error> {
+        if bps == 0 || amount == 0 {
+            return Ok(0);
+        }
+        let bps = bps as i128;
+        let quotient = amount / BPS_DENOMINATOR;
+        let remainder = amount % BPS_DENOMINATOR;
+
+        let from_quotient = quotient.checked_mul(bps).ok_or(Error::ArithmeticOverflow)?;
+        let from_remainder = remainder
+            .checked_mul(bps)
+            .ok_or(Error::ArithmeticOverflow)?
+            / BPS_DENOMINATOR;
+
+        from_quotient
+            .checked_add(from_remainder)
+            .ok_or(Error::ArithmeticOverflow)
+    }
+
+    /// Splits `amount` into worker/protocol/referrer shares per the current
+    /// [`FeeConfig`]. The worker absorbs the rounding remainder, so the
+    /// three shares always sum to exactly `amount` — see the "Protocol fee
+    /// engine" module docs for the proof sketch.
+    fn compute_payout_split(
+        env: &Env,
+        amount: i128,
+        has_referrer: bool,
+    ) -> Result<PayoutSplit, Error> {
+        let config = Self::get_fee_config(env.clone());
+
+        let protocol_share = Self::floor_bps_share(amount, config.protocol_bps)?;
+        let referrer_share = if has_referrer {
+            Self::floor_bps_share(amount, config.referrer_bps)?
+        } else {
+            0
+        };
+
+        let worker_share = amount
+            .checked_sub(protocol_share)
+            .and_then(|v| v.checked_sub(referrer_share))
+            .ok_or(Error::ArithmeticOverflow)?;
+
+        Ok(PayoutSplit {
+            worker_share,
+            protocol_share,
+            referrer_share,
+        })
+    }
+
+    fn credit_treasury(env: &Env, token: &Address, amount: i128) -> Result<(), Error> {
+        if amount == 0 {
+            return Ok(());
+        }
+        let key = DataKey::Treasury(token.clone());
+        let balance: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        let updated = balance
+            .checked_add(amount)
+            .ok_or(Error::ArithmeticOverflow)?;
+        env.storage().persistent().set(&key, &updated);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, LEDGERS_THRESHOLD, LEDGERS_EXTEND_TO);
+        Ok(())
+    }
+
+    /// Pays out a settling `appointment` split across worker, protocol
+    /// treasury, and optional referrer. Effects (treasury credit) happen
+    /// before interactions (token transfers), matching the rest of this
+    /// contract's checks-effects-interactions discipline.
+    fn pay_worker_with_fee_split(env: &Env, appointment: &Appointment) -> Result<(), Error> {
+        let split =
+            Self::compute_payout_split(env, appointment.amount, appointment.referrer.is_some())?;
+
+        Self::credit_treasury(env, &appointment.token, split.protocol_share)?;
+
+        let token_client = token::Client::new(env, &appointment.token);
+        if let Some(referrer) = &appointment.referrer {
+            if split.referrer_share > 0 {
+                token_client.transfer(
+                    &env.current_contract_address(),
+                    referrer,
+                    &split.referrer_share,
+                );
+            }
+        }
+        if split.worker_share > 0 {
+            token_client.transfer(
+                &env.current_contract_address(),
+                &appointment.worker,
+                &split.worker_share,
+            );
+        }
+
+        Ok(())
     }
 }
 

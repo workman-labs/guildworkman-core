@@ -160,6 +160,7 @@ fn fund_appointment(f: &Fixture, appointment_id: u64) {
         &f.worker,
         &f.payment_token.address,
         &APPOINTMENT_AMOUNT,
+        &None,
     );
 }
 

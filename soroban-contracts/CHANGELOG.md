@@ -16,6 +16,46 @@ sections start once something ships.
 
 ### Added
 
+- **Protocol fee engine with multi-party payout splits & treasury accounting**
+  ([#39](https://github.com/workman-labs/guildworkman-core/issues/39),
+  PR #TODO). `escrow`'s `confirm_completion` and the worker-favoring branch
+  of `resolve_dispute` now split the escrowed amount across worker, protocol
+  treasury, and an optional referrer instead of paying it out whole:
+  - **`FeeConfig { protocol_bps, referrer_bps }`**, governance-bounded by a
+    hard-coded `MAX_TOTAL_FEE_BPS` (1,500 = 15%) that `set_fee_config` checks
+    unconditionally — no governance signer can configure a combined
+    take-rate above it, so the worker is guaranteed at least 85% of every
+    settled appointment. `initialize` writes no `FeeConfig` entry at all —
+    `get_fee_config` treats an absent entry as `{0, 0}` (no fees) — so
+    instance storage for a contract that never calls `set_fee_config` is
+    byte-for-byte unchanged from before this feature existed.
+  - **Deterministic, overflow-safe rounding**: each of the protocol and
+    referrer shares floor-rounds independently via a split-multiply identity
+    that never lets `amount * bps` overflow `i128`, even for
+    `i128::MAX`-adjacent amounts; the worker absorbs the remainder, so
+    `worker_share + protocol_share + referrer_share == amount` exactly for
+    every input, with no path able to pay out more than was escrowed and no
+    dust ever stranded.
+  - **Per-token treasury accounting**: the protocol share is credited to
+    `DataKey::Treasury(token)` and stays in the contract's own balance until
+    a governance signer calls the new `withdraw_treasury`.
+  - **Referrer share** is paid directly to `appointment.referrer` (a new
+    `Option<Address>` field on `Appointment`, and a new final parameter on
+    `create_appointment`) when one is set; contributes nothing to the common
+    case of an appointment with no referrer.
+  - **Fees are charged only when a worker actually gets paid.**
+    `cancel_appointment` and the refund-to-client branch of `resolve_dispute`
+    are unchanged — they still return the full amount to the client with no
+    fee at all, on the reasoning that a refund for undelivered work should
+    leave the client whole.
+  - New entrypoints `set_fee_config`, `get_fee_config`, `get_treasury_balance`,
+    `withdraw_treasury`, all gated the same way `migrate` is (any single
+    current governance signer via `governance::require_signer`).
+  - New errors `FeeExceedsMaximum`, `ArithmeticOverflow`,
+    `InsufficientTreasuryBalance` (codes 42-44), appended so no existing code
+    moved.
+  - `settlement-router`'s mirrored `escrow::Appointment` type gained the same
+    `referrer` field to keep cross-contract decoding in lockstep.
 - **Cross-contract settlement router with auth-chained escrow → reputation →
   loyalty atomicity** ([#38](https://github.com/workman-labs/guildworkman-core/issues/38),
   [PR #50](https://github.com/workman-labs/guildworkman-core/pull/50)).
