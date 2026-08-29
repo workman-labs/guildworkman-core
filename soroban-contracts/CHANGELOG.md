@@ -18,7 +18,8 @@ sections start once something ships.
 
 - **Protocol fee engine with multi-party payout splits & treasury accounting**
   ([#39](https://github.com/workman-labs/guildworkman-core/issues/39),
-  PR #TODO). `escrow`'s `confirm_completion` and the worker-favoring branch
+  [PR #53](https://github.com/workman-labs/guildworkman-core/pull/53)).
+  `escrow`'s `confirm_completion` and the worker-favoring branch
   of `resolve_dispute` now split the escrowed amount across worker, protocol
   treasury, and an optional referrer instead of paying it out whole:
   - **`FeeConfig { protocol_bps, referrer_bps }`**, governance-bounded by a
