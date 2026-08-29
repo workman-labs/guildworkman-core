@@ -43,7 +43,10 @@ sections start once something ships.
   - **Referrer share** is paid directly to `appointment.referrer` (a new
     `Option<Address>` field on `Appointment`, and a new final parameter on
     `create_appointment`) when one is set; contributes nothing to the common
-    case of an appointment with no referrer.
+    case of an appointment with no referrer. `create_appointment` rejects a
+    `referrer` equal to `client` or `worker` up front — not exploitable (the
+    split invariant holds regardless), just a meaningless self-referral
+    that's cheap to reject rather than let onto the chain.
   - **Fees are charged only when a worker actually gets paid.**
     `cancel_appointment` and the refund-to-client branch of `resolve_dispute`
     are unchanged — they still return the full amount to the client with no
@@ -53,8 +56,8 @@ sections start once something ships.
     `withdraw_treasury`, all gated the same way `migrate` is (any single
     current governance signer via `governance::require_signer`).
   - New errors `FeeExceedsMaximum`, `ArithmeticOverflow`,
-    `InsufficientTreasuryBalance` (codes 42-44), appended so no existing code
-    moved.
+    `InsufficientTreasuryBalance`, `InvalidReferrer` (codes 42-45), appended
+    so no existing code moved.
   - `settlement-router`'s mirrored `escrow::Appointment` type gained the same
     `referrer` field to keep cross-contract decoding in lockstep.
 - **Cross-contract settlement router with auth-chained escrow → reputation →

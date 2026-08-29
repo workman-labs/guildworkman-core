@@ -570,7 +570,7 @@ stellar contract invoke --id $REPUTATION --source admin --network testnet \
 ### escrow
 
 - `initialize(admin: Address, governance_init: GovernanceInit)` — writes no `FeeConfig` entry; `get_fee_config` treats that as `{0, 0}` (no fees) until `set_fee_config` is called
-- `create_appointment(appointment_id: u64, client: Address, worker: Address, token: Address, amount: i128, referrer: Option<Address>)`
+- `create_appointment(appointment_id: u64, client: Address, worker: Address, token: Address, amount: i128, referrer: Option<Address>)` — rejects a `referrer` equal to `client` or `worker`
 - `confirm_completion(appointment_id: u64)` — client-only, pays the worker (split per [Protocol fee engine](#protocol-fee-engine))
 - `cancel_appointment(appointment_id: u64)` — client-only, refunds the client **in full, no fee taken**
 - `raise_dispute(appointment_id: u64, caller: Address)` — client or worker
@@ -650,6 +650,7 @@ only through `withdraw_treasury`, gated the same way as `set_fee_config`.
 | `FeeExceedsMaximum` | 42 | `set_fee_config` with `protocol_bps + referrer_bps` above `MAX_TOTAL_FEE_BPS`. |
 | `ArithmeticOverflow` | 43 | A checked arithmetic step in the fee split or treasury bookkeeping would have overflowed `i128`. |
 | `InsufficientTreasuryBalance` | 44 | `withdraw_treasury` requested more than the token's tracked treasury balance. |
+| `InvalidReferrer` | 45 | `create_appointment` with `referrer` equal to `client` or `worker`. |
 
 Codes 19-36 (milestone escrow and signer rotation) are documented in
 `src/lib.rs`; codes 37-41 are the circuit breaker's, listed in

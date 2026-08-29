@@ -243,6 +243,37 @@ fn set_fee_config_protocol_alone_above_cap_rejected() {
 }
 
 #[test]
+fn create_appointment_rejects_referrer_equal_to_worker() {
+    let ctx = setup();
+    let res = ctx.contract.try_create_appointment(
+        &1,
+        &ctx.client,
+        &ctx.worker,
+        &ctx.token,
+        &10_000,
+        &Some(ctx.worker.clone()),
+    );
+    assert_eq!(res, Err(Ok(Error::InvalidReferrer)));
+    // Rejected before any funds move.
+    assert_eq!(ctx.token_client.balance(&ctx.client), 1_000_000);
+}
+
+#[test]
+fn create_appointment_rejects_referrer_equal_to_client() {
+    let ctx = setup();
+    let res = ctx.contract.try_create_appointment(
+        &1,
+        &ctx.client,
+        &ctx.worker,
+        &ctx.token,
+        &10_000,
+        &Some(ctx.client.clone()),
+    );
+    assert_eq!(res, Err(Ok(Error::InvalidReferrer)));
+    assert_eq!(ctx.token_client.balance(&ctx.client), 1_000_000);
+}
+
+#[test]
 fn confirm_completion_splits_protocol_fee_with_no_referrer() {
     let ctx = setup();
     set_fee(&ctx, 1_000, 500); // 10% protocol, 5% referrer — no referrer here

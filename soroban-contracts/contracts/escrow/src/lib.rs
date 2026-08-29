@@ -51,6 +51,11 @@
 //!   floor-rounded, paid directly to `appointment.referrer` when it is
 //!   `Some`; zero when it is `None`. Most appointments have no referrer, and
 //!   this contributes nothing to their settlement path in that case.
+//!   `create_appointment` rejects a `referrer` equal to either `client` or
+//!   `worker` up front: not exploitable (the `sum == amount` invariant holds
+//!   regardless of who `referrer` is), just a meaningless self-referral
+//!   that's cheap to reject before it can confuse anyone reading the chain
+//!   state later.
 //! - **Worker share** — the remainder, `amount - protocol_share -
 //!   referrer_share`. Assigning the rounding remainder to the worker (rather
 //!   than to the protocol or the referrer) is the deterministic rounding
@@ -280,6 +285,7 @@ pub enum Error {
     FeeExceedsMaximum = 42,
     ArithmeticOverflow = 43,
     InsufficientTreasuryBalance = 44,
+    InvalidReferrer = 45,
 }
 
 impl From<governance::GovernanceError> for Error {
@@ -594,6 +600,16 @@ impl EscrowContract {
 
         if amount <= 0 {
             return Err(Error::InvalidAmount);
+        }
+        // A referrer sharing an address with either settlement party isn't
+        // exploitable — the split's `sum == amount` invariant holds no
+        // matter who `referrer` is — but it's a meaningless configuration
+        // that's cheap to reject outright rather than let through as a
+        // confusing no-op self-referral.
+        if let Some(referrer) = &referrer {
+            if *referrer == client || *referrer == worker {
+                return Err(Error::InvalidReferrer);
+            }
         }
 
         let key = DataKey::Appointment(appointment_id);
