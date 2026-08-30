@@ -115,11 +115,163 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, token, Address, BytesN, Env, String, Vec,
 };
 
+use soroban_sdk::contractevent;
+
 use guildworkman_governance_guard as governance;
 pub use guildworkman_governance_guard::{
     PauseState, PendingRotation, PendingUpgrade, ALL_SCOPES, MAX_PAUSE_DURATION,
     MAX_PAUSE_REASON_LEN, SCOPE_INTAKE, SCOPE_SETTLEMENT,
 };
+
+// ---------------------------------------------------------------------------
+// Contract events
+// ---------------------------------------------------------------------------
+
+/// Emitted when a client funds an appointment. Topics: `["escrow",
+/// "created", appointment_id, client, worker]`; data carries the amount.
+#[contractevent(topics = ["escrow", "created"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AppointmentCreated {
+    #[topic]
+    pub appointment_id: u64,
+    #[topic]
+    pub client: Address,
+    #[topic]
+    pub worker: Address,
+    pub amount: i128,
+}
+
+/// Emitted when a client confirms completion, paying the worker. Topics:
+/// `["escrow", "completed", appointment_id, client]`; data carries the
+/// worker address.
+#[contractevent(topics = ["escrow", "completed"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AppointmentCompleted {
+    #[topic]
+    pub appointment_id: u64,
+    #[topic]
+    pub client: Address,
+    pub worker: Address,
+}
+
+/// Emitted when a client cancels an appointment for a full refund. Topics:
+/// `["escrow", "cancelled", appointment_id, client]`; data carries the
+/// refunded amount.
+#[contractevent(topics = ["escrow", "cancelled"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AppointmentCancelled {
+    #[topic]
+    pub appointment_id: u64,
+    #[topic]
+    pub client: Address,
+    pub amount: i128,
+}
+
+/// Emitted when either party raises a dispute. Topics: `["escrow",
+/// "disputed", appointment_id, caller]`; data carries both participant
+/// addresses.
+#[contractevent(topics = ["escrow", "disputed"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AppointmentDisputed {
+    #[topic]
+    pub appointment_id: u64,
+    #[topic]
+    pub caller: Address,
+    pub client: Address,
+    pub worker: Address,
+}
+
+/// Emitted when the admin resolves a dispute. Topics: `["escrow",
+/// "resolved", appointment_id, recipient]`; data carries the amount and
+/// whether it was refunded to the client.
+#[contractevent(topics = ["escrow", "resolved"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AppointmentResolved {
+    #[topic]
+    pub appointment_id: u64,
+    #[topic]
+    pub recipient: Address,
+    pub amount: i128,
+    pub refund_to_client: bool,
+}
+
+/// Emitted when a milestone is added to a milestone escrow. Topics:
+/// `["escrow", "milestone_created", escrow_id, client]`.
+#[contractevent(topics = ["escrow", "milestone_created"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MilestoneCreated {
+    #[topic]
+    pub escrow_id: u64,
+    #[topic]
+    pub client: Address,
+    pub index: u32,
+    pub amount: i128,
+    pub deadline: u32,
+}
+
+/// Emitted when the client approves a milestone. Topics: `["escrow",
+/// "milestone_approved", escrow_id, client]`.
+#[contractevent(topics = ["escrow", "milestone_approved"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MilestoneApproved {
+    #[topic]
+    pub escrow_id: u64,
+    #[topic]
+    pub client: Address,
+    pub milestone_index: u32,
+}
+
+/// Emitted when milestone funds are released to the worker. Topics:
+/// `["escrow", "milestone_released", escrow_id, worker]`.
+#[contractevent(topics = ["escrow", "milestone_released"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MilestoneReleased {
+    #[topic]
+    pub escrow_id: u64,
+    #[topic]
+    pub worker: Address,
+    pub milestone_index: u32,
+    pub amount: i128,
+}
+
+/// Emitted when a milestone dispute is raised. Topics: `["escrow",
+/// "milestone_disputed", escrow_id, caller]`.
+#[contractevent(topics = ["escrow", "milestone_disputed"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MilestoneDisputed {
+    #[topic]
+    pub escrow_id: u64,
+    #[topic]
+    pub caller: Address,
+    pub milestone_index: u32,
+}
+
+/// Emitted when a milestone dispute is resolved. Topics: `["escrow",
+/// "milestone_resolved", escrow_id, recipient]`.
+#[contractevent(topics = ["escrow", "milestone_resolved"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MilestoneResolved {
+    #[topic]
+    pub escrow_id: u64,
+    #[topic]
+    pub recipient: Address,
+    pub milestone_index: u32,
+    pub amount: i128,
+}
+
+/// Emitted when a milestone escrow is created. Topics: `["escrow",
+/// "milestone_escrow_created", escrow_id, client, worker]`.
+#[contractevent(topics = ["escrow", "milestone_escrow_created"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MilestoneEscrowCreated {
+    #[topic]
+    pub escrow_id: u64,
+    #[topic]
+    pub client: Address,
+    #[topic]
+    pub worker: Address,
+    pub total_amount: i128,
+}
 
 /// Bump when this contract's storage layout actually changes shape and
 /// needs a real transformation in `migrate`. There's no such change yet.
@@ -621,6 +773,8 @@ impl EscrowContract {
         let token_client = token::Client::new(&env, &token);
         token_client.transfer(&client, env.current_contract_address(), &amount);
 
+        let client_addr = client.clone();
+        let worker_addr = worker.clone();
         let appointment = Appointment {
             client,
             worker,
@@ -633,6 +787,14 @@ impl EscrowContract {
         env.storage()
             .persistent()
             .extend_ttl(&key, LEDGERS_THRESHOLD, LEDGERS_EXTEND_TO);
+
+        AppointmentCreated {
+            appointment_id,
+            client: client_addr,
+            worker: worker_addr,
+            amount,
+        }
+        .publish(&env);
 
         Ok(())
     }
@@ -660,6 +822,14 @@ impl EscrowContract {
 
         appointment.status = Status::Completed;
         env.storage().persistent().set(&key, &appointment);
+
+        AppointmentCompleted {
+            appointment_id,
+            client: appointment.client,
+            worker: appointment.worker,
+        }
+        .publish(&env);
+
         Ok(())
     }
 
@@ -688,6 +858,14 @@ impl EscrowContract {
 
         appointment.status = Status::Cancelled;
         env.storage().persistent().set(&key, &appointment);
+
+        AppointmentCancelled {
+            appointment_id,
+            client: appointment.client,
+            amount: appointment.amount,
+        }
+        .publish(&env);
+
         Ok(())
     }
 
@@ -712,6 +890,15 @@ impl EscrowContract {
 
         appointment.status = Status::Disputed;
         env.storage().persistent().set(&key, &appointment);
+
+        AppointmentDisputed {
+            appointment_id,
+            caller,
+            client: appointment.client,
+            worker: appointment.worker,
+        }
+        .publish(&env);
+
         Ok(())
     }
 
@@ -756,6 +943,15 @@ impl EscrowContract {
 
         appointment.status = Status::Resolved;
         env.storage().persistent().set(&key, &appointment);
+
+        AppointmentResolved {
+            appointment_id,
+            recipient: recipient.clone(),
+            amount: appointment.amount,
+            refund_to_client,
+        }
+        .publish(&env);
+
         Ok(())
     }
 
@@ -789,6 +985,9 @@ impl EscrowContract {
             return Err(Error::AppointmentExists);
         }
 
+        let client_addr = init.client.clone();
+        let worker_addr = init.worker.clone();
+
         let token_client = token::Client::new(&env, &init.token);
         token_client.transfer(
             &init.client,
@@ -813,6 +1012,14 @@ impl EscrowContract {
             .persistent()
             .extend_ttl(&key, LEDGERS_THRESHOLD, LEDGERS_EXTEND_TO);
         Self::bump_instance(&env);
+
+        MilestoneEscrowCreated {
+            escrow_id,
+            client: client_addr,
+            worker: worker_addr,
+            total_amount: init.total_amount,
+        }
+        .publish(&env);
 
         Ok(())
     }
@@ -863,6 +1070,15 @@ impl EscrowContract {
         Self::bump_escrow(&env, &key);
         Self::bump_instance(&env);
 
+        MilestoneCreated {
+            escrow_id,
+            client: escrow.client.clone(),
+            index,
+            amount,
+            deadline,
+        }
+        .publish(&env);
+
         Ok(index)
     }
 
@@ -899,6 +1115,13 @@ impl EscrowContract {
         env.storage().persistent().set(&key, &escrow);
         Self::bump_escrow(&env, &key);
         Self::bump_instance(&env);
+
+        MilestoneApproved {
+            escrow_id,
+            client: escrow.client.clone(),
+            milestone_index,
+        }
+        .publish(&env);
 
         Ok(())
     }
@@ -951,6 +1174,14 @@ impl EscrowContract {
 
         env.storage().persistent().set(&key, &escrow);
         Self::bump_escrow(&env, &key);
+
+        MilestoneReleased {
+            escrow_id,
+            worker: escrow.worker.clone(),
+            milestone_index,
+            amount: milestone.amount,
+        }
+        .publish(&env);
 
         // Interaction: transfer funds.
         let token_client = token::Client::new(&env, &escrow.token);
@@ -1010,6 +1241,13 @@ impl EscrowContract {
         env.storage().persistent().set(&key, &escrow);
         Self::bump_escrow(&env, &key);
         Self::bump_instance(&env);
+
+        MilestoneDisputed {
+            escrow_id,
+            caller,
+            milestone_index,
+        }
+        .publish(&env);
 
         Ok(())
     }
@@ -1089,6 +1327,14 @@ impl EscrowContract {
             recipient,
             &milestone.amount,
         );
+
+        MilestoneResolved {
+            escrow_id,
+            recipient: recipient.clone(),
+            milestone_index,
+            amount: milestone.amount,
+        }
+        .publish(&env);
 
         Self::bump_instance(&env);
         Ok(())
