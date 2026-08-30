@@ -5,6 +5,7 @@ import com.guildworkman.api.booking.service.ReservationNotHeldException;
 import com.guildworkman.api.booking.service.SlotUnavailableException;
 import com.guildworkman.api.escrow.service.EscrowOrchestrationNotFoundException;
 import com.guildworkman.api.escrow.service.ReconciliationRequeueNotAllowedException;
+import com.guildworkman.api.discovery.InvalidSearchCursorException;
 import com.guildworkman.api.exceptions.*;
 import com.guildworkman.api.payment.service.DiscrepancyNotFoundException;
 import com.guildworkman.api.payment.service.IllegalPaymentTransitionException;
@@ -282,6 +283,17 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
     public ResponseEntity<ProblemDetail> handleGuildWorkmanException(GuildWorkmanException exception) {
         return respond(HttpStatus.BAD_REQUEST, "bad-request",
                 "Request could not be processed", exception.getMessage());
+    }
+
+    /**
+     * A worker-discovery {@code cursor} parameter that didn't decode. 400 rather
+     * than ignoring it, so a client never silently restarts pagination from the
+     * top (and repeats rows) because of a truncated or stale cursor.
+     */
+    @ExceptionHandler(InvalidSearchCursorException.class)
+    public ResponseEntity<ProblemDetail> handleInvalidSearchCursor(InvalidSearchCursorException exception) {
+        return respond(HttpStatus.BAD_REQUEST, "invalid-search-cursor",
+                "Invalid pagination cursor", exception.getMessage());
     }
 
     // --- Bean validation ----------------------------------------------------

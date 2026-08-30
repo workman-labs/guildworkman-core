@@ -41,11 +41,20 @@ jobs:
         with:
           java-version: '17'
           distribution: 'temurin'
-          cache: maven
+      # Cache the Maven dependency tree explicitly, keyed on the module's
+      # pom.xml, so a run that doesn't change dependencies resolves nothing from
+      # Maven Central. Kept as its own step (rather than setup-java's
+      # `cache: maven`) so the key/paths are visible and tunable here, and the
+      # restore-keys fall back to the newest partial cache on a pom change.
+      - name: Cache Maven packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-maven-${{ hashFiles('backend-api/pom.xml') }}
+          restore-keys: |
+            ${{ runner.os }}-maven-
       # `verify` runs the full test suite and then packages the application, so
       # a change that tests green but can't be built still fails the workflow.
-      # Maven's dependency cache is handled by setup-java's `cache: maven`
-      # above, keyed on pom.xml.
       - name: Build and test
         env:
           DATABASE_URL: jdbc:postgresql://localhost:5432/service

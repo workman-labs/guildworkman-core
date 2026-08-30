@@ -224,6 +224,7 @@
 						<stellar.signing.broadcast-poll-delay-ms>3600000</stellar.signing.broadcast-poll-delay-ms>
 						<stellar.signing.confirm-poll-delay-ms>3600000</stellar.signing.confirm-poll-delay-ms>
 						<stellar.signing.lease-sweep-delay-ms>3600000</stellar.signing.lease-sweep-delay-ms>
+						<guildworkman.discovery.reputation.poll-delay-ms>3600000</guildworkman.discovery.reputation.poll-delay-ms>
 						<!--
 						    Every distinct combination of @SpringBootTest properties/@MockBean
 						    set gets its own cached ApplicationContext (and its own HikariCP

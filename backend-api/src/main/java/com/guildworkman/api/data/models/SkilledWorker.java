@@ -20,7 +20,16 @@ import static java.time.LocalDateTime.now;
 @Setter
 @Getter
 @Entity
-@Table(name = "skilled_workers")
+@Table(name = "skilled_workers", indexes = {
+        // Composite B-tree serving the bounding-box prefilter of worker
+        // discovery (GET /api/v1/discovery/workers). The distance search narrows
+        // to a lat/lon box on this index before the exact Haversine runs, so a
+        // radius query never degrades into a full-table scan — see
+        // backend-api/docs/WORKER_DISCOVERY.md.
+        @Index(name = "idx_skilled_workers_geo", columnList = "latitude, longitude"),
+        // Backs the discovery category filter and its facet count.
+        @Index(name = "idx_skilled_workers_category", columnList = "category")
+})
 public class SkilledWorker {
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
@@ -64,6 +73,12 @@ public class SkilledWorker {
     private double latitude;
     private double longitude;
 
+    /**
+     * Whether the worker is currently taking work. Nullable on purpose: a legacy
+     * row that predates this column, or a worker who has never set it, is "not
+     * stated" and is treated as available by worker discovery
+     * ({@code GET /api/v1/discovery/workers}) rather than being hidden.
+     */
+    private Boolean available;
+
 }
-
-

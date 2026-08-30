@@ -70,6 +70,12 @@ public class SecurityConfig {
             // client surface with it — a deliberate auth-scope change, not
             // something to slip in with the concurrency fix.
             "/api/v1/booking/**",
+            // Worker discovery is the marketplace's front door: finding a worker
+            // by location/skill has to work before anyone signs in, the same way
+            // the booking calendar does. It only exposes the already-public
+            // worker profile fields plus a materialised reputation score, and is
+            // read-only. Same access level as /api/v1/skilledWorker/** by design.
+            "/api/v1/discovery/**",
             "/api/v1/chain/events/**",
             // Paystack webhooks. Unauthenticated because the provider holds no
             // credential of ours and posts from a rotating IP range; the
